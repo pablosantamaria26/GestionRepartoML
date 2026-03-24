@@ -233,6 +233,17 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 <div class="cfm-btns"><button class="cfm-cancel" id="cfmNo">Cancelar</button><button class="cfm-ok" id="cfmYes">Confirmar</button></div></div>
 </div>
 
+<div class="cfm-bg" id="waBg">
+<div class="cfm" style="max-width:380px;text-align:left">
+  <h3 style="text-align:center">✅ Rendición enviada</h3>
+  <div id="waResumen" style="font-size:.82rem;color:var(--tx2);max-height:40vh;overflow-y:auto;margin-bottom:14px;white-space:pre-line;line-height:1.5;background:var(--sf2);border-radius:var(--rs);padding:10px 12px;border:1px solid var(--bd)"></div>
+  <a id="waBtn" href="#" target="_blank" style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px;border:none;border-radius:var(--rs);background:#25D366;color:#fff;font-family:var(--f);font-size:.92rem;font-weight:700;text-decoration:none;text-align:center">
+    📱 Enviar por WhatsApp
+  </a>
+  <p style="font-size:.72rem;color:var(--tx3);text-align:center;margin-top:8px">Enviá el resumen para completar la rendición</p>
+</div>
+</div>
+
 <div class="toast" id="toast"></div>
 <div class="ldbg" id="ldBg"><div class="spn"></div><span id="ldTx">Cargando...</span></div>
 <input type="file" id="fCam" accept="image/*" capture="camera" style="display:none"/>
@@ -282,11 +293,13 @@ async function checkTS(){
 function applyTB(e){
   ['Mañana','Tarde'].forEach(t=>{
     const st=e[t]||'sinDatos',b=t==='Mañana'?$('turnoM'):$('turnoT'),s=t==='Mañana'?$('tMS'):$('tTS');
-    if(st==='finalizado'){b.disabled=true;s.textContent='🔒 Finalizado';s.style.color='#d4302f';}
-    else if(st==='abierto'){b.disabled=false;s.textContent='📦 En curso';s.style.color='#0d9f57';}
-    else{b.disabled=false;s.textContent='Disponible';s.style.color='';}
+    if(st==='finalizado'){b.disabled=true;s.textContent='🔒 Rendición enviada';s.style.color='#d4302f';}
+    else if(st==='abierto'){b.disabled=false;s.textContent='📦 Reparto activo — listo para empezar';s.style.color='#0d9f57';}
+    else{b.disabled=true;s.textContent='Sin reparto cargado';s.style.color='#8990a3';}
   });
-  if(e['Mañana']==='finalizado'&&e['Tarde']==='finalizado')toast('🟢 Jornada completa',5000);
+  if(e['Mañana']==='finalizado'&&e['Tarde']==='finalizado')toast('🟢 Jornada completa — ambos turnos finalizados',5000);
+  // Si ambos sin datos
+  if((e['Mañana']||'sinDatos')==='sinDatos'&&(e['Tarde']||'sinDatos')==='sinDatos')toast('No hay repartos cargados para hoy',4000);
 }
 
 async function selT(t){
@@ -416,15 +429,66 @@ $('dTg').addEventListener('click',()=>{const c=!$('mDv').checked;$('mDv').checke
 // ═══════════════════ CONFIRM DELIVERY ════════════════
 async function confirmDel(){
   if(S.sav||S.mi<0)return;const p=S.peds[S.mi];
-  p.formaPago1=S.fp1||'';p.importePagado1=S.fp1==='No pagó'?0:(S.a1||0);p.formaPago2=S.fp2||'';p.importePagado2=S.a2||0;
-  p.devolucion=$('mDv').checked;p.notasDevolucion=$('mNt').value.trim();
-  if(!p.devolucion&&!p.formaPago1&&(p.importeTotal||0)>0)return toast('Elegí forma de pago o devolución');
-  p.entregado=true;S.sav=true;closeM();render();await push1(p);cL();
-  toast(p.formaPago1==='No pagó'?'🚫 Entregado (sin pago)':'✅ Entregado');
-  try{await gp({action:'guardarDatosReparto',pedidos:[p]});}catch(e){qR(p);}S.sav=false;
+  // Gather modal data
+  const fp1=S.fp1||'';const a1=fp1==='No pagó'?0:(S.a1||0);
+  const fp2=S.fp2||'';const a2=S.a2||0;
+  const isDev=$('mDv').checked;const notes=$('mNt').value.trim();
+
+  // ▼▼▼ VALIDACIONES ROBUSTAS ▼▼▼
+  if(!isDev && !fp1 && (p.importeTotal||0)>0) return toast('Elegí forma de pago o marcá devolución');
+  if(fp1 && fp1!=='No pagó' && a1<=0) return toast('Ingresá el importe del pago');
+  if(fp2 && a2<=0) return toast('Ingresá el importe del segundo pago');
+  if((fp1==='Transferencia'||fp2==='Transferencia') && !p.comprobanteId) return toast('📷 Transferencia requiere comprobante');
+  if(isDev && !notes) return toast('Anotá qué se devolvió');
+  // ▲▲▲ FIN VALIDACIONES ▲▲▲
+
+  p.formaPago1=fp1;p.importePagado1=a1;p.formaPago2=fp2;p.importePagado2=a2;
+  p.devolucion=isDev;p.notasDevolucion=notes;
+  p.entregado=true;S.sav=true;closeM();render();
+
+  // Guardar en Firebase + cache (instantáneo)
+  await push1(p);cL();
+  toast(fp1==='No pagó'?'🚫 Entregado (sin pago)':'✅ Entregado');
+
+  // Guardar en GAS (background) — si falla, encolar
+  try{await gp({action:'guardarDatosReparto',pedidos:[p]});}
+  catch(e){qR(p);console.warn('GAS save queued:',e);}
+  S.sav=false;
 }
-function qR(p){try{const q=JSON.parse(localStorage.getItem('rq')||'[]');q.push(p);localStorage.setItem('rq',JSON.stringify(q));}catch(_){}}
-async function fR(){const q=JSON.parse(localStorage.getItem('rq')||'[]');if(!q.length)return;try{await gp({action:'guardarDatosReparto',pedidos:q});localStorage.removeItem('rq');toast('📤 Sincronizado');}catch(_){}}
+
+// ═══════════════════ OFFLINE QUEUE ═══════════════════
+function qR(p){try{const q=JSON.parse(localStorage.getItem('rq')||'[]');q.push({...p,_queuedAt:Date.now()});localStorage.setItem('rq',JSON.stringify(q));toast('💾 Guardado offline, se subirá automáticamente');}catch(_){}}
+
+async function fR(){
+  // Flush pedidos queue
+  const q=JSON.parse(localStorage.getItem('rq')||'[]');
+  if(q.length>0){
+    try{await gp({action:'guardarDatosReparto',pedidos:q});localStorage.removeItem('rq');toast('📤 '+q.length+' pedido(s) sincronizado(s)');}
+    catch(_){console.warn('Flush retry failed, keeping queue');}
+  }
+  // Flush photos queue
+  const pq=JSON.parse(localStorage.getItem('pq')||'[]');
+  if(pq.length>0){
+    let uploaded=0;const remaining=[];
+    for(const item of pq){
+      try{const r=await gp({action:'subirComprobante',base64:item.b,numeroCliente:item.n},30000);
+        if(r&&r.fileId){uploaded++;const p=S.peds.find(x=>x.numeroCliente===item.n);if(p){p.comprobanteId=r.fileId;push1(p);}}
+        else remaining.push(item);}
+      catch(_){remaining.push(item);}
+    }
+    if(remaining.length>0)localStorage.setItem('pq',JSON.stringify(remaining));
+    else localStorage.removeItem('pq');
+    if(uploaded>0){toast('📷 '+uploaded+' foto(s) subida(s)');render();cL();}
+  }
+}
+
+// Auto-retry every 30s if there's queued data
+setInterval(()=>{
+  if(!navigator.onLine)return;
+  const hasQ=(JSON.parse(localStorage.getItem('rq')||'[]')).length>0;
+  const hasPQ=(JSON.parse(localStorage.getItem('pq')||'[]')).length>0;
+  if(hasQ||hasPQ)fR();
+},30000);
 
 // ═══════════════════ PHOTOS ══════════════════════════
 function compImg(f,mw=1024,q=0.7){return new Promise((res,rej)=>{const im=new Image(),u=URL.createObjectURL(f);im.onload=()=>{URL.revokeObjectURL(u);let w=im.width,h=im.height;if(w>mw){h=Math.round(h*mw/w);w=mw;}const cv=document.createElement('canvas');cv.width=w;cv.height=h;cv.getContext('2d').drawImage(im,0,0,w,h);cv.toBlob(b=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(b);},'image/jpeg',q);};im.onerror=rej;im.src=u;});}
@@ -441,24 +505,95 @@ async function openRt(){sLoad('Ruta...');try{const r=await gp({action:'obtenerUr
     const a=pd.map(p=>p.coordenadas?encodeURIComponent(p.coordenadas):encodeURIComponent((p.domicilio||'')+', '+(p.localidad||'')+', Argentina'));
     window.open('https://www.google.com/maps/dir/'+o+'/'+a.join('/'),'_blank');}}
 
-// ═══════════ RENDICION — con modal de confirm ════════
+// ═══════════ RENDICION — con backup + WhatsApp ═══════
+const WA_PHONE='5491133395487';
+
+function buildResumen(pedidos,turno,rep){
+  const hoy=fAR().split('-').reverse().join('/');
+  let txt=`📦 *RENDICIÓN DE REPARTO*\n📅 ${hoy} — Turno ${turno}\n🧑‍🔧 Repartidor: ${rep}\n${'─'.repeat(30)}\n\n`;
+  let totEfectivo=0,totTransf=0,totCheque=0,noPago=0,devs=0;
+
+  pedidos.forEach((p,i)=>{
+    const imp=Number(p.importeTotal)||0;
+    const p1=Number(p.importePagado1)||0;
+    const p2=Number(p.importePagado2)||0;
+    const tot=p1+p2;
+    const fp1=p.formaPago1||'';const fp2=p.formaPago2||'';
+
+    if(fp1.includes('fectivo'))totEfectivo+=p1;if(fp2.includes('fectivo'))totEfectivo+=p2;
+    if(fp1.includes('ransfer'))totTransf+=p1;if(fp2.includes('ransfer'))totTransf+=p2;
+    if(fp1.includes('heque'))totCheque+=p1;if(fp2.includes('heque'))totCheque+=p2;
+    if(fp1==='No pagó')noPago++;
+    if(p.devolucion)devs++;
+
+    txt+=`*${i+1}. ${p.nombre}* (Nº ${p.numeroCliente})\n`;
+    txt+=`   Factura: $${mn(imp)}\n`;
+    if(fp1==='No pagó'){txt+=`   ❌ No pagó\n`;}
+    else{
+      if(fp1)txt+=`   ${fp1}: $${mn(p1)}\n`;
+      if(fp2)txt+=`   ${fp2}: $${mn(p2)}\n`;
+      txt+=`   Total pagado: $${mn(tot)}${tot>=imp?' ✅':' ⚠️'}\n`;
+    }
+    if(p.devolucion)txt+=`   ♻️ Devolución: ${p.notasDevolucion||'sin detalle'}\n`;
+    txt+='\n';
+  });
+
+  txt+=`${'─'.repeat(30)}\n`;
+  txt+=`📊 *RESUMEN DEL TURNO*\n`;
+  txt+=`💵 Efectivo: $${mn(totEfectivo)}\n`;
+  txt+=`📲 Transferencias: $${mn(totTransf)}\n`;
+  txt+=`📝 Cheques: $${mn(totCheque)}\n`;
+  if(noPago>0)txt+=`❌ No pagaron: ${noPago}\n`;
+  if(devs>0)txt+=`♻️ Devoluciones: ${devs}\n`;
+  txt+=`\n✅ Total clientes: ${pedidos.length}`;
+  return txt;
+}
+
+function showWaModal(pedidos){
+  const txt=buildResumen(pedidos,S.turno,S.rep);
+  $('waResumen').textContent=txt;
+  const url=`https://wa.me/${WA_PHONE}?text=${encodeURIComponent(txt)}`;
+  $('waBtn').href=url;
+  $('waBg').classList.add('open');
+}
+
 function sendRend(){
   const pd=S.peds.filter(p=>!p.entregado&&!p.devolucion);if(pd.length>0)return toast('Quedan '+pd.length+' pendientes');
+  const rq=JSON.parse(localStorage.getItem('rq')||'[]');
+  const pq=JSON.parse(localStorage.getItem('pq')||'[]');
+  if(rq.length>0||pq.length>0){toast('⏳ Hay datos pendientes de sincronizar. Esperá un momento...');fR();return;}
   $('cfmTitle').textContent='¿Enviar rendición?';$('cfmMsg').textContent=`Turno ${S.turno} — ${S.rep}. Esta acción es irreversible.`;
   $('cfmBg').classList.add('open');
 }
 $('cfmNo').addEventListener('click',()=>$('cfmBg').classList.remove('open'));
 $('cfmYes').addEventListener('click',async()=>{
   $('cfmBg').classList.remove('open');sLoad('Enviando rendición...');
+
+  // Backup local + snapshot para WhatsApp
+  const backupKey=`backup_${fAR()}_${S.turno}`;
+  const snapshot=[...S.peds]; // copia antes de limpiar
+  try{localStorage.setItem(backupKey,JSON.stringify(S.peds));}catch(_){}
+
   try{const r=await gp({action:'enviarRendicion',repartidor:S.rep,turno:S.turno},30000);hLoad();
-    if(r&&r.message){toast('✅ '+r.message,5000);localStorage.removeItem(`c_${fAR()}_${S.turno}`);
+    if(r&&r.message){
+      localStorage.removeItem(`c_${fAR()}_${S.turno}`);
+      localStorage.removeItem(backupKey);
       try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}
       try{await db.ref(fbP()).remove();}catch(_){}
       S.peds=[];S.lk=true;render();
-      // Volver a pantalla de turnos después de 2s
-      setTimeout(()=>{$('turnoScreen').classList.add('show');checkTS();},2000);
-    }else toast('Error: '+(r?.message||'?'));}
-  catch(e){hLoad();toast('Error: '+e.message);}
+      // Mostrar modal de WhatsApp con resumen
+      showWaModal(snapshot);
+    }else{toast('Error: '+(r?.message||'?'));toast('💾 Backup local disponible',5000);}}
+  catch(e){hLoad();toast('Error al enviar. Datos respaldados localmente.',5000);}
+});
+
+// Cuando cierra el modal de WhatsApp → volver a pantalla de turnos
+$('waBg').addEventListener('click',e=>{
+  if(e.target===$('waBg')){$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();}
+});
+// También si toca el botón de WA (después de abrir WA, vuelve a la app)
+$('waBtn').addEventListener('click',()=>{
+  setTimeout(()=>{$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();},1000);
 });
 
 // ═══════════════════ EVENTS ══════════════════════════
@@ -473,8 +608,10 @@ $('fGal').addEventListener('change',e=>hPhoto(e.target.files[0]));
 $('bSv').addEventListener('click',saveOrd);
 $('bRt').addEventListener('click',openRt);
 $('bSn').addEventListener('click',sendRend);
-window.addEventListener('online',()=>{sSync('sync');fR();toast('Conexión restablecida');});
-window.addEventListener('offline',()=>{sSync('off');toast('Sin conexión');});
+window.addEventListener('online',()=>{sSync('sync');toast('🌐 Conexión restablecida. Sincronizando...');
+  setTimeout(()=>fR(),1000); // Flush queued data after 1s
+});
+window.addEventListener('offline',()=>{sSync('off');toast('📴 Sin conexión. Todo se guarda localmente y se sincroniza al volver.',5000);});
 initLogin();
 if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(_=>{});
 window.openModal=openModal;window.uOrd=uOrd;
