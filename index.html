@@ -297,16 +297,36 @@ async function selT(t){
 // ═══════════════════ START APP ════════════════════════
 async function startApp(){
   $('chipT').textContent=S.turno;$('repLbl').textContent=S.rep;S.lk=false;sLoad('Cargando...');let ok=false;
+
+  // ▼▼▼ PROTECCIÓN: verificar si turno está finalizado ANTES de cualquier llamada a GAS
+  // Esto evita que GAS regenere un turno que ya fue rendido
+  let turnoFinalizado=false;
+  try{const s=await db.ref(fbE()+'/'+S.turno).once('value');if(s.val()==='finalizado')turnoFinalizado=true;}catch(_){}
+  // También checar con GAS el estado (no obtenerDatosReparto, sino getEstadoTurnos que NO regenera)
+  if(!turnoFinalizado){
+    try{const r=await gp({action:'getEstadoTurnos',repartidor:S.rep},8000);
+      if(r&&r.estado&&r.estado[S.turno]==='finalizado'){turnoFinalizado=true;try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}}
+    }catch(_){}}
+  if(turnoFinalizado){hLoad();S.peds=[];S.lk=true;render();toast('🔒 Turno finalizado',3000);lockUI();
+    // Limpiar cualquier dato viejo de Firebase y cache
+    try{await db.ref(fbP()).remove();}catch(_){}
+    localStorage.removeItem(`c_${fAR()}_${S.turno}`);
+    return;}
+  // ▲▲▲ FIN PROTECCIÓN
+
+  // 1) Firebase (rápido)
   try{const s=await db.ref(fbP()+'/pedidos').once('value');const d=s.val();
     if(d&&Object.keys(d).length>0){S.peds=Object.values(d);render();hLoad();ok=true;toast('📦 Cargado');}}catch(_){}
+  // 2) localStorage
   if(!ok){const c=localStorage.getItem(`c_${fAR()}_${S.turno}`);if(c){try{S.peds=JSON.parse(c);render();hLoad();ok=true;toast('📱 Desde caché');}catch(_){}}}
+  // 3) GAS — SOLO si no hay datos locales (esta llamada SÍ puede regenerar, pero solo si el turno NO está finalizado)
   if(!ok){try{const r=await gp({action:'obtenerDatosReparto',turno:S.turno,repartidor:S.rep});
-    if(r&&r.isTurnoFinalizado){hLoad();S.peds=[];S.lk=true;render();toast('🔒 Finalizado',4000);try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}lockUI();setupSync();return;}
+    if(r&&r.isTurnoFinalizado){hLoad();S.peds=[];S.lk=true;render();toast('🔒 Finalizado',4000);try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}lockUI();return;}
     if(r&&Array.isArray(r.pedidos)&&r.pedidos.length>0){S.peds=r.pedidos;await pushA();render();hLoad();ok=true;toast('📦 Sincronizado');}}catch(e){console.warn('GAS:',e);}}
   if(!ok){hLoad();toast('No hay pedidos');}
-  if(ok){gp({action:'obtenerDatosReparto',turno:S.turno,repartidor:S.rep}).then(r=>{
-    if(r&&r.isTurnoFinalizado){toast('🔒 Finalizado');S.lk=true;try{db.ref(fbE()+'/'+S.turno).set('finalizado');db.ref(fbP()).remove();}catch(_){}lockUI();return;}
-    if(r&&Array.isArray(r.pedidos)&&r.pedidos.length>0&&r.pedidos.length!==S.peds.length){S.peds=r.pedidos;pushA();render();cL();}
+  // Background verify — usa getEstadoTurnos (seguro, no regenera) en vez de obtenerDatosReparto
+  if(ok){gp({action:'getEstadoTurnos',repartidor:S.rep}).then(r=>{
+    if(r&&r.estado&&r.estado[S.turno]==='finalizado'){toast('🔒 Finalizado');S.lk=true;try{db.ref(fbE()+'/'+S.turno).set('finalizado');db.ref(fbP()).remove();}catch(_){}lockUI();}
   }).catch(_=>{});}
   setupSync();
 }
