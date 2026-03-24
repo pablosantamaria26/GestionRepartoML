@@ -244,6 +244,16 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 </div>
 </div>
 
+<div class="cfm-bg" id="installBg">
+<div class="cfm" style="max-width:340px">
+  <div style="font-size:2.5rem;text-align:center;margin-bottom:8px">📲</div>
+  <h3 style="text-align:center">Instalar Reparto ML</h3>
+  <p style="font-size:.85rem;color:var(--tx2);text-align:center;margin-bottom:16px">Instalá la app en tu celular para acceso directo, funcionar offline y recibir un mejor rendimiento.</p>
+  <button id="installBtn" style="width:100%;padding:13px;border:none;border-radius:var(--rs);background:var(--ac);color:#fff;font-family:var(--f);font-size:.95rem;font-weight:700;cursor:pointer;margin-bottom:8px">Instalar ahora</button>
+  <button id="installLater" style="width:100%;padding:10px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--sf2);color:var(--tx2);font-family:var(--f);font-size:.85rem;font-weight:500;cursor:pointer">Más tarde</button>
+</div>
+</div>
+
 <div class="toast" id="toast"></div>
 <div class="ldbg" id="ldBg"><div class="spn"></div><span id="ldTx">Cargando...</span></div>
 <input type="file" id="fCam" accept="image/*" capture="camera" style="display:none"/>
@@ -550,6 +560,7 @@ function buildResumen(pedidos,turno,rep){
 }
 
 function showWaModal(pedidos){
+  waSent=false; // reset
   const txt=buildResumen(pedidos,S.turno,S.rep);
   $('waResumen').textContent=txt;
   const url=`https://wa.me/${WA_PHONE}?text=${encodeURIComponent(txt)}`;
@@ -587,13 +598,18 @@ $('cfmYes').addEventListener('click',async()=>{
   catch(e){hLoad();toast('Error al enviar. Datos respaldados localmente.',5000);}
 });
 
-// Cuando cierra el modal de WhatsApp → volver a pantalla de turnos
+// Cuando cierra el modal de WhatsApp → SOLO si ya envió por WA
+let waSent=false;
 $('waBg').addEventListener('click',e=>{
-  if(e.target===$('waBg')){$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();}
+  if(e.target===$('waBg')){
+    if(!waSent){toast('📱 Enviá el resumen por WhatsApp para continuar');return;}
+    $('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();
+  }
 });
-// También si toca el botón de WA (después de abrir WA, vuelve a la app)
 $('waBtn').addEventListener('click',()=>{
-  setTimeout(()=>{$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();},1000);
+  waSent=true;
+  toast('✅ WhatsApp abierto. Enviá el mensaje y volvé.',4000);
+  setTimeout(()=>{$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();},2500);
 });
 
 // ═══════════════════ EVENTS ══════════════════════════
@@ -612,6 +628,38 @@ window.addEventListener('online',()=>{sSync('sync');toast('🌐 Conexión restab
   setTimeout(()=>fR(),1000); // Flush queued data after 1s
 });
 window.addEventListener('offline',()=>{sSync('off');toast('📴 Sin conexión. Todo se guarda localmente y se sincroniza al volver.',5000);});
+// ═══════════════════ PWA INSTALL ══════════════════════
+let deferredPrompt=null;
+window.addEventListener('beforeinstallprompt',e=>{
+  e.preventDefault();deferredPrompt=e;
+  // Show install modal if not installed and not dismissed recently
+  const dismissed=localStorage.getItem('installDismissed');
+  const now=Date.now();
+  if(!dismissed||now-Number(dismissed)>86400000){ // show again after 24h
+    setTimeout(()=>$('installBg').classList.add('open'),1500);
+  }
+});
+$('installBtn').addEventListener('click',async()=>{
+  if(!deferredPrompt){
+    // Fallback for browsers that don't support beforeinstallprompt (iOS)
+    $('installBg').querySelector('p').textContent='En Safari: tocá el botón Compartir (⬆️) y luego "Agregar a pantalla de inicio"';
+    $('installBtn').style.display='none';
+    return;
+  }
+  deferredPrompt.prompt();
+  const{outcome}=await deferredPrompt.userChoice;
+  if(outcome==='accepted')toast('✅ App instalada');
+  deferredPrompt=null;$('installBg').classList.remove('open');
+});
+$('installLater').addEventListener('click',()=>{
+  localStorage.setItem('installDismissed',String(Date.now()));
+  $('installBg').classList.remove('open');
+});
+// If already installed as PWA, don't show
+if(window.matchMedia('(display-mode: standalone)').matches||window.navigator.standalone){
+  // Already installed, no need to prompt
+}
+
 initLogin();
 if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(_=>{});
 window.openModal=openModal;window.uOrd=uOrd;
