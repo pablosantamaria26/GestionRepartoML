@@ -446,8 +446,9 @@ const FIREBASE_CONFIG = {
   appId: "1:283563066503:web:db5ad2f760f9811fdae422"
 };
 
-// ⚠️ IMPORTANTE: Reemplazá esta URL con tu Web App URL deployada de GAS
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbx4yKCWXEtYXrhZBakUyOo8x6dZo9nozNnXYSELy6wAdKpsoEQbg7plRVRHj3rOy6KL/exec';
+// ⚠️ IMPORTANTE: Reemplazá con la URL de tu Cloudflare Worker proxy
+// Ejemplo: https://reparto-proxy.tu-subdominio.workers.dev
+const GAS_URL = 'https://gestiondereparto.santamariapablodaniel.workers.dev/';
 
 // ─── FIREBASE INIT ────────────────────────────────────
 firebase.initializeApp(FIREBASE_CONFIG);
@@ -516,36 +517,87 @@ function initLogin() {
 // ─── TURNO SCREEN ─────────────────────────────────────
 function showTurnoScreen() {
   $('turnoScreen').classList.add('show');
-  // Check GAS for turno status
+
+  // Carga paralela: Firebase (rápido) + GAS (certero)
   checkTurnoStatus();
+
   $('turnoManana').onclick = () => selectTurno('Mañana');
   $('turnoTarde').onclick = () => selectTurno('Tarde');
 }
 
+// Estado de turnos almacenado en Firebase para chequeo rápido
+const fbEstadoPath = () => `estado/${fechaAR()}`;
+
 async function checkTurnoStatus() {
+  // Fase 1: Firebase (instantáneo, ~100ms)
+  try {
+    const snap = await db.ref(fbEstadoPath()).once('value');
+    const fbEstado = snap.val(); // { Mañana: 'finalizado', Tarde: 'abierto' } o null
+    if (fbEstado) {
+      applyTurnoButtons(fbEstado);
+      // Si ambos finalizados, ni esperamos a GAS
+      if (fbEstado['Mañana'] === 'finalizado' && fbEstado['Tarde'] === 'finalizado') {
+        return; // no hace falta verificar más
+      }
+    }
+  } catch (e) {
+    console.warn('Firebase estado read failed:', e);
+  }
+
+  // Fase 2: GAS (certero, fuente de verdad — en paralelo si Firebase no cerró todo)
   try {
     const resp = await gasPost({ action: 'getEstadoTurnos', repartidor: S.repartidor });
     if (resp && resp.estado) {
-      ['Mañana', 'Tarde'].forEach(t => {
-        const st = resp.estado[t];
-        const btn = t === 'Mañana' ? $('turnoManana') : $('turnoTarde');
-        const sub = t === 'Mañana' ? $('turnoMananaStatus') : $('turnoTardeStatus');
-        if (st === 'finalizado') {
-          btn.disabled = true;
-          sub.textContent = '🔒 Finalizado';
-        } else if (st === 'abierto') {
-          sub.textContent = '📦 En curso';
-        } else {
-          sub.textContent = 'Sin datos';
-        }
-      });
+      applyTurnoButtons(resp.estado);
+      // Sincronizar estado a Firebase para futuras cargas rápidas
+      try {
+        await db.ref(fbEstadoPath()).set(resp.estado);
+      } catch (_) {}
     }
   } catch (e) {
-    console.warn('No se pudo verificar estado de turnos:', e);
+    console.warn('GAS turno check failed (working with Firebase/cache):', e);
   }
 }
 
-function selectTurno(turno) {
+function applyTurnoButtons(estado) {
+  ['Mañana', 'Tarde'].forEach(t => {
+    const st = estado[t] || 'sinDatos';
+    const btn = t === 'Mañana' ? $('turnoManana') : $('turnoTarde');
+    const sub = t === 'Mañana' ? $('turnoMananaStatus') : $('turnoTardeStatus');
+    if (st === 'finalizado') {
+      btn.disabled = true;
+      sub.textContent = '🔒 Finalizado';
+      sub.style.color = '#ef4444';
+    } else if (st === 'abierto') {
+      btn.disabled = false;
+      sub.textContent = '📦 En curso';
+      sub.style.color = '#22c55e';
+    } else {
+      btn.disabled = false;
+      sub.textContent = 'Sin datos';
+      sub.style.color = '';
+    }
+  });
+
+  // Si ambos finalizados, no hay nada que hacer
+  if (estado['Mañana'] === 'finalizado' && estado['Tarde'] === 'finalizado') {
+    $('turnoManana').disabled = true;
+    $('turnoTarde').disabled = true;
+    toast('🟢 Jornada completa. Ambos turnos finalizados.', 5000);
+  }
+}
+
+async function selectTurno(turno) {
+  // Doble chequeo: verificar en Firebase que el turno no se finalizó mientras estaba en pantalla
+  try {
+    const snap = await db.ref(fbEstadoPath() + '/' + turno).once('value');
+    if (snap.val() === 'finalizado') {
+      toast('🔒 Este turno ya fue finalizado.');
+      applyTurnoButtons({ [turno]: 'finalizado' });
+      return;
+    }
+  } catch (_) {}
+
   S.turno = turno;
   localStorage.setItem('ultimoTurno', turno);
   $('turnoScreen').classList.remove('show');
@@ -553,72 +605,139 @@ function selectTurno(turno) {
 }
 
 // ─── GAS COMMUNICATION ───────────────────────────────
-async function gasPost(body) {
-  const resp = await fetch(GAS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify(body),
-  });
-  return resp.json();
+async function gasPost(body, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    return resp.json();
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
 }
 
 // ─── MAIN APP START ──────────────────────────────────
 async function startApp() {
   $('chipTurno').textContent = S.turno;
   $('repartidorLabel').textContent = S.repartidor;
-
-  // 1) Try to load from Firebase (fast)
   showLoad('Cargando pedidos...');
-  const fbRef = db.ref(fbPath() + '/pedidos');
 
+  // Estrategia de carga por prioridad:
+  // 1° Firebase (instantáneo) → muestra datos ya
+  // 2° localStorage (si Firebase falla) → muestra datos offline
+  // 3° GAS (background) → refresca y sincroniza
+
+  let loaded = false;
+
+  // ── Intento 1: Firebase (rápido, ~100ms) ──
   try {
-    const snap = await fbRef.once('value');
+    const snap = await db.ref(fbPath() + '/pedidos').once('value');
     const fbData = snap.val();
     if (fbData && Object.keys(fbData).length > 0) {
       S.pedidos = Object.values(fbData);
       render();
       hideLoad();
+      loaded = true;
       toast('📦 Pedidos cargados');
-      setupRealtimeSync();
-      return;
     }
   } catch (e) {
     console.warn('Firebase read failed:', e);
   }
 
-  // 2) Fallback: load from GAS and push to Firebase
-  try {
-    const resp = await gasPost({
-      action: 'obtenerDatosReparto',
-      turno: S.turno,
-      repartidor: S.repartidor
-    });
-    if (resp && resp.success !== false && Array.isArray(resp.pedidos)) {
-      S.pedidos = resp.pedidos;
-      // Push to Firebase for future fast loads
-      await pushAllToFirebase();
-      render();
-      hideLoad();
-      toast('📦 Reparto sincronizado desde sistema');
-      setupRealtimeSync();
-      return;
+  // ── Intento 2: localStorage (si Firebase no tenía datos) ──
+  if (!loaded) {
+    const cached = localStorage.getItem(`cache_${fechaAR()}_${S.turno}`);
+    if (cached) {
+      try {
+        S.pedidos = JSON.parse(cached);
+        render();
+        hideLoad();
+        loaded = true;
+        toast('📱 Cargado desde caché');
+      } catch (_) {}
     }
-  } catch (e) {
-    console.warn('GAS load failed:', e);
   }
 
-  // 3) Last resort: localStorage
-  const cached = localStorage.getItem(`cache_${fechaAR()}_${S.turno}`);
-  if (cached) {
-    S.pedidos = JSON.parse(cached);
-    render();
-    hideLoad();
-    toast('📱 Cargado desde caché local');
-  } else {
-    hideLoad();
-    toast('No se encontraron pedidos');
+  // ── Intento 3: GAS (si no hay nada local) ──
+  if (!loaded) {
+    try {
+      const resp = await gasPost({
+        action: 'obtenerDatosReparto',
+        turno: S.turno,
+        repartidor: S.repartidor
+      });
+
+      // Verificar si el turno ya está finalizado (respuesta de GAS)
+      if (resp && resp.isTurnoFinalizado) {
+        hideLoad();
+        S.pedidos = [];
+        render();
+        toast('🔒 Este turno ya fue finalizado', 4000);
+        // Marcar en Firebase para futuras consultas
+        try { await db.ref(fbEstadoPath() + '/' + S.turno).set('finalizado'); } catch (_) {}
+        lockUI();
+        setupRealtimeSync();
+        return;
+      }
+
+      if (resp && resp.success !== false && Array.isArray(resp.pedidos) && resp.pedidos.length > 0) {
+        S.pedidos = resp.pedidos;
+        await pushAllToFirebase();
+        render();
+        hideLoad();
+        loaded = true;
+        toast('📦 Reparto sincronizado desde sistema');
+      }
+    } catch (e) {
+      console.warn('GAS load failed:', e);
+    }
   }
+
+  if (!loaded) {
+    hideLoad();
+    toast('No se encontraron pedidos para este turno');
+  }
+
+  // ── Background: si cargamos de Firebase/cache, verificar con GAS que sigue vigente ──
+  if (loaded) {
+    gasPost({ action: 'obtenerDatosReparto', turno: S.turno, repartidor: S.repartidor })
+      .then(resp => {
+        if (resp && resp.isTurnoFinalizado) {
+          toast('🔒 Este turno fue finalizado');
+          try { db.ref(fbEstadoPath() + '/' + S.turno).set('finalizado'); } catch (_) {}
+          lockUI();
+          return;
+        }
+        // Si GAS tiene datos más frescos (diferente cantidad), actualizar
+        if (resp && Array.isArray(resp.pedidos) && resp.pedidos.length > 0) {
+          const gasPedidos = resp.pedidos;
+          if (gasPedidos.length !== S.pedidos.length) {
+            console.log('GAS tiene datos distintos, actualizando...');
+            S.pedidos = gasPedidos;
+            pushAllToFirebase();
+            render();
+            cacheLocal();
+          }
+        }
+      })
+      .catch(e => console.warn('Background GAS check failed:', e));
+  }
+
   setupRealtimeSync();
+}
+
+// Bloquea UI cuando turno está finalizado
+function lockUI() {
+  $('btnSave').disabled = true;
+  $('btnRoute').disabled = true;
+  $('btnSend').disabled = true;
 }
 
 // ─── FIREBASE SYNC ───────────────────────────────────
@@ -940,11 +1059,26 @@ async function sendRendicion() {
     hideLoad();
     if (resp && resp.message) {
       toast('✅ ' + resp.message, 5000);
+
+      // === LIMPIEZA COMPLETA POST-RENDICIÓN ===
+      // 1) Limpiar cache local
       localStorage.removeItem(`cache_${fechaAR()}_${S.turno}`);
-      // Clear Firebase
-      await db.ref(fbPath()).remove();
+
+      // 2) Marcar turno como finalizado en Firebase (para que no se vuelva a cargar)
+      try {
+        await db.ref(fbEstadoPath() + '/' + S.turno).set('finalizado');
+      } catch (_) {}
+
+      // 3) Limpiar pedidos de Firebase (ya no se necesitan)
+      try {
+        await db.ref(fbPath()).remove();
+      } catch (_) {}
+
+      // 4) Limpiar estado local
       S.pedidos = [];
       render();
+      lockUI();
+
     } else {
       toast('Error en rendición: ' + (resp?.message || 'desconocido'));
     }
@@ -982,6 +1116,13 @@ window.addEventListener('offline', () => {
 
 // ─── BOOT ────────────────────────────────────────────
 initLogin();
+
+// Service Worker registration
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js')
+    .then(r => console.log('SW registered:', r.scope))
+    .catch(e => console.warn('SW registration failed:', e));
+}
 
 // Expose for onclick in cards
 window.openModal = openModal;
