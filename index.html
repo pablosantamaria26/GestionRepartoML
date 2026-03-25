@@ -45,7 +45,22 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 .prog{flex-shrink:0;height:3px;background:var(--sf2)}
 .prog .fill{height:100%;background:linear-gradient(90deg,#10b981,#34d399);transition:width .4s;width:0%}
 
-/* ── SCROLL ── */
+/* ── DASHBOARD ── */
+.dash{flex-shrink:0;display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;padding:8px 10px 4px;background:var(--bg)}
+.dash-item{background:var(--sf);border-radius:var(--rs);padding:8px 10px;text-align:center;box-shadow:var(--sh);border:1px solid var(--bd)}
+.dash-lbl{font-size:.65rem;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.04em}
+.dash-val{font-size:1rem;font-weight:700;margin-top:1px}
+.dash-ok{color:var(--ok)}.dash-wn{color:var(--wn)}.dash-ac{color:var(--ac)}
+
+/* ── SEARCH ── */
+.search-wrap{flex-shrink:0;padding:6px 10px;background:var(--bg)}
+.search-input{width:100%;padding:9px 12px 9px 34px;font-size:.88rem;font-family:var(--f);background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-radius:999px;outline:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%238990a3' viewBox='0 0 16 16'%3E%3Cpath d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85zm-5.242.656a5 5 0 1 1 0-10 5 5 0 0 1 0 10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:10px center;transition:border-color .15s}
+.search-input:focus{border-color:var(--ac);box-shadow:0 0 0 2px rgba(37,99,235,.1)}
+.search-input::placeholder{color:var(--tx3)}
+
+/* ── CARD AMOUNT ── */
+.c-amt{font-family:var(--m);font-size:.85rem;font-weight:700;color:var(--tx);margin-bottom:4px}
+.card.done .c-amt{opacity:.5}
 .scroll{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:8px 10px 100px}
 
 /* ── BOTTOM BAR ── */
@@ -199,6 +214,12 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 </div>
 <div class="info-strip"><span><span class="sdot ok" id="sDot"></span><span id="sLbl">Listo</span></span><span id="repLbl">—</span><strong id="cntLbl">0/0</strong></div>
 <div class="prog"><div class="fill" id="pFill"></div></div>
+<div class="dash">
+  <div class="dash-item"><div class="dash-lbl">Cobrado</div><div class="dash-val dash-ok" id="dCob">$0</div></div>
+  <div class="dash-item"><div class="dash-lbl">Pendiente</div><div class="dash-val dash-wn" id="dPen">$0</div></div>
+  <div class="dash-item"><div class="dash-lbl">Efectivo</div><div class="dash-val dash-ac" id="dEfe">$0</div></div>
+</div>
+<div class="search-wrap"><input type="text" class="search-input" id="searchIn" placeholder="Buscar cliente..." autocomplete="off"/></div>
 <div class="scroll" id="scrollArea"><div class="empty" id="emSt">No hay pedidos.</div><div id="cC"></div></div>
 <div class="bbar">
   <button class="bb bb-sv" id="bSv"><span class="ico">💾</span>Guardar</button>
@@ -363,23 +384,42 @@ function cL(){try{localStorage.setItem(`c_${fAR()}_${S.turno}`,JSON.stringify(S.
 let gst=null;function sGas(){clearTimeout(gst);gst=setTimeout(async()=>{try{await gp({action:'guardarDatosReparto',pedidos:S.peds});}catch(_){}},3000);}
 
 // ═══════════════════ RENDER ══════════════════════════
+let searchTerm='';
+$('searchIn').addEventListener('input',e=>{searchTerm=e.target.value.toLowerCase().trim();render();});
+
 function render(){
   const c=$('cC'),e=$('emSt');
   if(!S.peds.length){c.innerHTML='';e.style.display='block';uUI();return;}e.style.display='none';
-  const sr=[...S.peds].sort((a,b)=>{if(!a.entregado&&b.entregado)return-1;if(a.entregado&&!b.entregado)return 1;return(Number(a.orden)||9999)-(Number(b.orden)||9999);});
+  let filtered=S.peds;
+  if(searchTerm)filtered=S.peds.filter(p=>(p.nombre||'').toLowerCase().includes(searchTerm)||(p.numeroCliente||'').includes(searchTerm)||(p.localidad||'').toLowerCase().includes(searchTerm));
+  const sr=[...filtered].sort((a,b)=>{if(!a.entregado&&b.entregado)return-1;if(a.entregado&&!b.entregado)return 1;return(Number(a.orden)||9999)-(Number(b.orden)||9999);});
+  if(!sr.length&&searchTerm){c.innerHTML='<div class="empty">Sin resultados para "'+searchTerm+'"</div>';uUI();return;}
   c.innerHTML=sr.map(p=>{
     const ri=S.peds.indexOf(p),tp=(Number(p.importePagado1)||0)+(Number(p.importePagado2)||0),np=p.entregado&&!p.devolucion&&tp===0;
     let cl='card';if(p.entregado)cl+=' done';if(p.devolucion)cl+=' dev';if(np)cl+=' nopay';
     let bd='';if(p.entregado)bd+='<span class="b b-ok">✅ Entregado</span>';else bd+='<span class="b b-p">Pendiente</span>';
     if(p.devolucion)bd+='<span class="b b-d">⚠️ Devolución</span>';if(np)bd+='<span class="b b-np">🔴 Sin pago</span>';if(p.comprobanteId)bd+='<span class="b b-ph">📷</span>';
-    return`<div class="${cl}" data-ri="${ri}" draggable="false"><div class="ct"><span class="cnu">Nº ${p.numeroCliente||''}</span><input type="number" class="cord" value="${p.orden||''}" ${p.entregado?'disabled':''} onclick="event.stopPropagation()" onchange="uOrd(${ri},this.value)" min="1"/></div><div class="cn">${p.nombre||''}</div><div class="ca">📍 ${p.domicilio||''}, ${p.localidad||''}</div><div class="cbs">${bd}</div><div class="drag-handle" data-dh="1">⠿</div></div>`;
+    return`<div class="${cl}" data-ri="${ri}" draggable="false"><div class="ct"><span class="cnu">Nº ${p.numeroCliente||''}</span><input type="number" class="cord" value="${p.orden||''}" ${p.entregado?'disabled':''} onclick="event.stopPropagation()" onchange="uOrd(${ri},this.value)" min="1"/></div><div class="cn">${p.nombre||''}</div><div class="c-amt">$${mn(p.importeTotal)}</div><div class="ca">📍 ${p.domicilio||''}, ${p.localidad||''}</div><div class="cbs">${bd}</div><div class="drag-handle" data-dh="1">⠿</div></div>`;
   }).join('');
-  // Attach card click (not on drag handle or input)
   c.querySelectorAll('.card').forEach(el=>{el.addEventListener('click',e=>{if(e.target.closest('.drag-handle')||e.target.tagName==='INPUT')return;openModal(+el.dataset.ri);});});
   initDrag();uUI();cL();
 }
-function uUI(){const t=S.peds.length,d=S.peds.filter(p=>p.entregado).length;$('cntLbl').textContent=`${d}/${t}`;$('pFill').style.width=(t>0?Math.round(d/t*100):0)+'%';
-  $('bSn').disabled=S.lk||!(t>0&&d===t);$('bSv').disabled=S.lk;$('bRt').disabled=S.lk;}
+function uUI(){
+  const t=S.peds.length,d=S.peds.filter(p=>p.entregado).length;
+  $('cntLbl').textContent=`${d}/${t}`;
+  $('pFill').style.width=(t>0?Math.round(d/t*100):0)+'%';
+  $('bSn').disabled=S.lk||!(t>0&&d===t);$('bSv').disabled=S.lk;$('bRt').disabled=S.lk;
+  // Dashboard totals
+  let cob=0,pen=0,efe=0;
+  S.peds.forEach(p=>{
+    const imp=Number(p.importeTotal)||0,p1=Number(p.importePagado1)||0,p2=Number(p.importePagado2)||0;
+    if(p.entregado){cob+=p1+p2;if((p.formaPago1||'').includes('fectivo'))efe+=p1;if((p.formaPago2||'').includes('fectivo'))efe+=p2;}
+    else pen+=imp;
+  });
+  $('dCob').textContent='$'+mn(cob);$('dPen').textContent='$'+mn(pen);$('dEfe').textContent='$'+mn(efe);
+}
+// Vibration helper
+function vib(ms=50){try{navigator.vibrate&&navigator.vibrate(ms);}catch(_){}}
 function uOrd(i,v){S.peds[i].orden=parseInt(v)||0;push1(S.peds[i]);sGas();cL();}
 
 // ═══════════════════ DRAG TO REORDER ═════════════════
@@ -455,6 +495,7 @@ async function confirmDel(){
   p.formaPago1=fp1;p.importePagado1=a1;p.formaPago2=fp2;p.importePagado2=a2;
   p.devolucion=isDev;p.notasDevolucion=notes;
   p.entregado=true;S.sav=true;closeM();render();
+  vib(80); // haptic feedback
 
   // Guardar en Firebase + cache (instantáneo)
   await push1(p);cL();
