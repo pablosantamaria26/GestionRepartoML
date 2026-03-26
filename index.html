@@ -8,6 +8,8 @@
 <link rel="manifest" href="manifest.json"/>
 <link rel="icon" href="icon-192.png"/>
 <title>Reparto ML</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.2/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.4/jspdf.plugin.autotable.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
@@ -635,6 +637,8 @@ $('cfmYes').addEventListener('click',async()=>{
       S.peds=[];S.lk=true;render();
       // Mostrar modal de WhatsApp con resumen
       showWaModal(snapshot);
+      // Background: generar PDF y subir a Drive (no bloquea al usuario)
+      generarYSubirPDF(snapshot,S.turno,S.rep).catch(e=>console.warn('PDF bg error:',e));
     }else{toast('Error: '+(r?.message||'?'));toast('💾 Backup local disponible',5000);}}
   catch(e){hLoad();toast('Error al enviar. Datos respaldados localmente.',5000);}
 });
@@ -652,6 +656,97 @@ $('waBtn').addEventListener('click',()=>{
   toast('✅ WhatsApp abierto. Enviá el mensaje y volvé.',4000);
   setTimeout(()=>{$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();},2500);
 });
+
+// ═══════════════════ PDF GENERATION ══════════════════
+async function generarYSubirPDF(pedidos,turno,rep){
+  try{
+    const{jsPDF}=window.jspdf;
+    const doc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4'});
+    const hoy=fAR();const [y,m,d]=hoy.split('-');const fecha=`${d}/${m}/${y}`;
+    const dias=['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+    const dia=dias[new Date().getDay()];
+    const pw=doc.internal.pageSize.getWidth();
+
+    // Header
+    doc.setFillColor(37,99,235);doc.rect(0,0,pw,32,\'F\');
+    doc.setTextColor(255);doc.setFontSize(18);doc.setFont('helvetica','bold');
+    doc.text('RENDICIÓN DE REPARTO',pw/2,14,{align:'center'});
+    doc.setFontSize(10);doc.setFont('helvetica','normal');
+    doc.text(`${dia} ${fecha}  |  Turno ${turno}  |  Repartidor: ${rep}`,pw/2,24,{align:'center'});
+
+    // Table data
+    let totEfe=0,totTrans=0,totCheq=0,noPago=0,devs=0;
+    const rows=pedidos.map((p,i)=>{
+      const imp=Number(p.importeTotal)||0;
+      const p1=Number(p.importePagado1)||0,p2=Number(p.importePagado2)||0;
+      const tot=p1+p2;const fp1=p.formaPago1||'';const fp2=p.formaPago2||'';
+      if(fp1.includes('fectivo'))totEfe+=p1;if(fp2.includes('fectivo'))totEfe+=p2;
+      if(fp1.includes('ransfer'))totTrans+=p1;if(fp2.includes('ransfer'))totTrans+=p2;
+      if(fp1.includes('heque'))totCheq+=p1;if(fp2.includes('heque'))totCheq+=p2;
+      if(fp1==='No pagó')noPago++;if(p.devolucion)devs++;
+      let pago=fp1==='No pagó'?'No pagó':(fp1?fp1+': $'+mn(p1):'');
+      if(fp2&&p2>0)pago+=' / '+fp2+': $'+mn(p2);
+      const estado=p.devolucion?'Devolución':(tot>=imp?'Pagado':'Parcial');
+      return[String(i+1),p.numeroCliente||'',p.nombre||'','$'+mn(imp),pago||'-','$'+mn(tot),estado,p.devolucion?(p.notasDevolucion||'Sí'):''];
+    });
+
+    doc.autoTable({
+      startY:38,
+      head:[['#','Nº','Cliente','Factura','Forma de Pago','Pagado','Estado','Notas']],
+      body:rows,
+      theme:'grid',
+      styles:{fontSize:7.5,cellPadding:2.5,font:'helvetica',textColor:[20,23,32]},
+      headStyles:{fillColor:[37,99,235],textColor:[255,255,255],fontStyle:'bold',fontSize:7.5},
+      alternateRowStyles:{fillColor:[240,241,245]},
+      columnStyles:{
+        0:{cellWidth:8,halign:'center'},
+        1:{cellWidth:14},
+        2:{cellWidth:35},
+        3:{cellWidth:22,halign:'right'},
+        4:{cellWidth:38},
+        5:{cellWidth:22,halign:'right',fontStyle:'bold'},
+        6:{cellWidth:18,halign:'center'},
+        7:{cellWidth:33}
+      },
+      didParseCell:(data)=>{
+        if(data.section==='body'&&data.column.index===6){
+          const v=data.cell.raw;
+          if(v==='Pagado')data.cell.styles.textColor=[13,159,87];
+          else if(v==='Parcial')data.cell.styles.textColor=[212,48,47];
+          else if(v==='Devolución')data.cell.styles.textColor=[194,130,10];
+        }
+      }
+    });
+
+    // Summary box
+    const fy=doc.lastAutoTable.finalY+8;
+    doc.setFillColor(240,241,245);doc.roundedRect(14,fy,pw-28,36,3,3,'F');
+    doc.setDrawColor(220,224,232);doc.roundedRect(14,fy,pw-28,36,3,3,'S');
+    doc.setTextColor(37,99,235);doc.setFontSize(11);doc.setFont('helvetica','bold');
+    doc.text('RESUMEN DEL TURNO',pw/2,fy+8,{align:'center'});
+    doc.setFontSize(9);doc.setFont('helvetica','normal');doc.setTextColor(60,65,80);
+    const col1=22,col2=pw/2+5;
+    doc.text(`Efectivo: $${mn(totEfe)}`,col1,fy+17);
+    doc.text(`Transferencias: $${mn(totTrans)}`,col2,fy+17);
+    doc.text(`Cheques: $${mn(totCheq)}`,col1,fy+24);
+    doc.text(`No pagaron: ${noPago}`,col2,fy+24);
+    doc.text(`Devoluciones: ${devs}`,col1,fy+31);
+    doc.text(`Total clientes: ${pedidos.length}`,col2,fy+31);
+
+    // Footer
+    const ph=doc.internal.pageSize.getHeight();
+    doc.setFontSize(7);doc.setTextColor(150);
+    doc.text('Generado por Reparto ML — Mercado Limpio Distribuidora',pw/2,ph-6,{align:'center'});
+
+    // Convert to base64 and upload
+    const pdfBase64=doc.output('datauristring').split(',')[1];
+    const nombreArchivo=`RENDICIÓN - ${dia} ${fecha} - TURNO ${turno.toUpperCase()} - ${rep}.pdf`;
+
+    const resp=await gp({action:'guardarPDFRendicion',base64:pdfBase64,nombreArchivo:nombreArchivo,repartidor:rep,turno:turno},30000);
+    if(resp&&resp.success)console.log('PDF subido:',resp.url);
+    else console.warn('PDF upload failed:',resp);
+  }catch(e){console.warn('PDF generation error:',e);}
+}
 
 // ═══════════════════ EVENTS ══════════════════════════
 $('mOk').addEventListener('click',confirmDel);
