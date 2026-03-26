@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reparto-ml-v6';
+const CACHE_NAME = 'reparto-ml-v7';
 const ASSETS = [
   './',
   './index.html',
