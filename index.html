@@ -233,6 +233,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 <div class="mdl" id="mdl">
   <div class="mlk" id="lkOvl"><span style="font-size:2rem">🔒</span><span style="font-weight:700;color:var(--dg)">Pedido procesado</span>
     <button class="mlk-btn" id="lkClose">← Volver</button>
+    <button class="mlk-btn" id="undoBtn" style="display:none;color:var(--wn);border-color:var(--wnbd);background:var(--wnbg)">↩ Deshacer entrega</button>
   </div>
   <div class="handle"></div>
   <div class="mhd"><div><h3 id="mTi">—</h3><div class="mhd-pr" id="mPr">—</div></div><div class="mhd-x" id="mX">✕</div></div>
@@ -263,7 +264,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
   <a id="waBtn" href="#" target="_blank" style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px;border:none;border-radius:var(--rs);background:#25D366;color:#fff;font-family:var(--f);font-size:.92rem;font-weight:700;text-decoration:none;text-align:center">
     📱 Enviar por WhatsApp
   </a>
-  <p style="font-size:.72rem;color:var(--tx3);text-align:center;margin-top:8px">Enviá el resumen para completar la rendición</p>
+  <button id="waClose" style="width:100%;padding:9px;border:none;background:none;color:var(--tx3);font-size:.8rem;cursor:pointer;margin-top:6px;font-family:var(--f)">Cerrar sin enviar</button>
 </div>
 </div>
 
@@ -307,9 +308,17 @@ async function gp(body,to=15000){
 
 // ═══════════════════ LOGIN ═══════════════════════════
 function initLogin(){
-  const k=`r_${fAR()}`,sv=localStorage.getItem(k);
-  if(sv){S.rep=sv;$('loginScreen').style.display='none';showTS();return;}
-  $('loginBtn').onclick=()=>{const n=$('loginName').value.trim();if(!n)return toast('Ingresá tu nombre');S.rep=n;localStorage.setItem(k,n);$('loginScreen').style.display='none';showTS();};
+  const k=`r_${fAR()}`;
+  // Buscar nombre hoy, o el último nombre guardado permanentemente
+  const sv=localStorage.getItem(k)||localStorage.getItem('rep_name');
+  if(sv){S.rep=sv;localStorage.setItem(k,sv);$('loginScreen').style.display='none';showTS();return;}
+  // Pre-completar el input con el último nombre conocido
+  const last=localStorage.getItem('rep_name');if(last)$('loginName').value=last;
+  $('loginBtn').onclick=()=>{
+    const n=$('loginName').value.trim();if(!n)return toast('Ingresá tu nombre');
+    S.rep=n;localStorage.setItem(k,n);localStorage.setItem('rep_name',n); // guarda permanente
+    $('loginScreen').style.display='none';showTS();
+  };
   $('loginName').onkeydown=e=>{if(e.key==='Enter')$('loginBtn').click();};
 }
 
@@ -369,6 +378,10 @@ async function startApp(){
   if(!ok){try{const r=await gp({action:'obtenerDatosReparto',turno:S.turno,repartidor:S.rep});
     if(r&&r.isTurnoFinalizado){hLoad();S.peds=[];S.lk=true;render();toast('🔒 Finalizado',4000);try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}lockUI();return;}
     if(r&&Array.isArray(r.pedidos)&&r.pedidos.length>0){S.peds=r.pedidos;await pushA();render();hLoad();ok=true;toast('📦 Sincronizado');}}catch(e){console.warn('GAS:',e);}}
+  // 4) Fallback último reparto conocido (sin fecha) — para primer arranque sin señal
+  if(!ok){const fb=localStorage.getItem(`last_${S.rep}_${S.turno}`);
+    if(fb){try{S.peds=JSON.parse(fb);render();hLoad();ok=true;
+      toast('⚠️ Sin señal — usando último reparto guardado. Sincronizará al recuperar red.',6000);}catch(_){}}}
   if(!ok){hLoad();toast('No hay pedidos');}
   // Background verify — usa getEstadoTurnos (seguro, no regenera) en vez de obtenerDatosReparto
   if(ok){gp({action:'getEstadoTurnos',repartidor:S.rep}).then(r=>{
@@ -379,10 +392,21 @@ async function startApp(){
 function lockUI(){$('bSv').disabled=true;$('bRt').disabled=true;$('bSn').disabled=true;}
 
 // ═══════════════════ FIREBASE SYNC ═══════════════════
-function setupSync(){db.ref(fbP()+'/pedidos').on('value',s=>{const d=s.val();if(!d||S.sav)return;const i=Object.values(d);if(JSON.stringify(i)!==JSON.stringify(S.peds)){S.peds=i;render();cL();}});}
+let _syncRef=null;
+function setupSync(){
+  if(_syncRef){try{_syncRef.off();}catch(_){}} // limpiar listener anterior
+  _syncRef=db.ref(fbP()+'/pedidos');
+  _syncRef.on('value',s=>{const d=s.val();if(!d||S.sav)return;const i=Object.values(d);if(JSON.stringify(i)!==JSON.stringify(S.peds)){S.peds=i;render();cL();}});
+}
 async function pushA(){try{const o={};S.peds.forEach(p=>{o[p.numeroCliente||Math.random()]=p;});await db.ref(fbP()+'/pedidos').set(o);sSync('ok');}catch(_){sSync('off');}}
 async function push1(p){try{sSync('sync');await db.ref(fbP()+'/pedidos/'+p.numeroCliente).set(p);sSync('ok');}catch(_){sSync('off');}}
-function cL(){try{localStorage.setItem(`c_${fAR()}_${S.turno}`,JSON.stringify(S.peds));}catch(_){}}
+function cL(){
+  try{
+    localStorage.setItem(`c_${fAR()}_${S.turno}`,JSON.stringify(S.peds));
+    // Copia "último reparto conocido" sin fecha — fallback para arranque offline
+    if(S.rep&&S.turno)localStorage.setItem(`last_${S.rep}_${S.turno}`,JSON.stringify(S.peds));
+  }catch(_){}
+}
 let gst=null;function sGas(){clearTimeout(gst);gst=setTimeout(async()=>{try{await gp({action:'guardarDatosReparto',pedidos:S.peds});}catch(_){}},3000);}
 
 // ═══════════════════ RENDER ══════════════════════════
@@ -401,7 +425,7 @@ function render(){
     let cl='card';if(p.entregado)cl+=' done';if(p.devolucion)cl+=' dev';if(np)cl+=' nopay';
     let bd='';if(p.entregado)bd+='<span class="b b-ok">✅ Entregado</span>';else bd+='<span class="b b-p">Pendiente</span>';
     if(p.devolucion)bd+='<span class="b b-d">⚠️ Devolución</span>';if(np)bd+='<span class="b b-np">🔴 Sin pago</span>';if(p.comprobanteId)bd+='<span class="b b-ph">📷</span>';
-    return`<div class="${cl}" data-ri="${ri}" draggable="false"><div class="ct"><span class="cnu">Nº ${p.numeroCliente||''}</span><input type="number" class="cord" value="${p.orden||''}" ${p.entregado?'disabled':''} onclick="event.stopPropagation()" onchange="uOrd(${ri},this.value)" min="1"/></div><div class="cn">${p.nombre||''}</div><div class="c-amt">$${mn(p.importeTotal)}</div><div class="ca">📍 ${p.domicilio||''}, ${p.localidad||''}</div><div class="cbs">${bd}</div><div class="drag-handle" data-dh="1">⠿</div></div>`;
+    return`<div class="${cl}" data-ri="${ri}" draggable="false"><div class="ct"><span class="cnu">Nº ${p.numeroCliente||''}</span><input type="number" class="cord" value="${p.orden||''}" ${p.entregado?'disabled':''} onclick="event.stopPropagation()" onchange="uOrd(${ri},this.value)" onfocus="if(!this.dataset.r){this.blur();this.dataset.r='1';}" onblur="this.dataset.r=''" title="Tocá dos veces para editar el orden" min="1"/></div><div class="cn">${p.nombre||''}</div><div class="c-amt">$${mn(p.importeTotal)}</div><div class="ca">📍 ${p.domicilio||''}, ${p.localidad||''}</div><div class="cbs">${bd}</div><div class="drag-handle" data-dh="1">⠿</div></div>`;
   }).join('');
   c.querySelectorAll('.card').forEach(el=>{el.addEventListener('click',e=>{if(e.target.closest('.drag-handle')||e.target.tagName==='INPUT')return;openModal(+el.dataset.ri);});});
   initDrag();uUI();cL();
@@ -462,6 +486,8 @@ function openModal(i){
   $('p2T').classList.toggle('show',sa&&!S.fp2);$('p2S').classList.toggle('show',!!S.fp2);$('a2I').value=S.a2||'';
   $('mDv').checked=!!p.devolucion;$('dTg').classList.toggle('sel',!!p.devolucion);$('dNt').classList.toggle('show',!!p.devolucion);$('mNt').value=p.notasDevolucion||'';
   const lk=!!p.entregado;$('lkOvl').classList.toggle('show',lk);['mOk','mPh','mGl','mDv'].forEach(id=>$(id).disabled=lk);
+  // Mostrar "Deshacer" solo si el turno no fue finalizado aún
+  $('undoBtn').style.display=(lk&&!S.lk)?'block':'none';
   $('mBg').classList.add('open');
 }
 function closeM(){$('mBg').classList.remove('open');S.mi=-1;}
@@ -689,18 +715,14 @@ $('cfmYes').addEventListener('click',async()=>{
   }
 });
 
-// Cuando cierra el modal de WhatsApp → SOLO si ya envió por WA
 let waSent=false;
-$('waBg').addEventListener('click',e=>{
-  if(e.target===$('waBg')){
-    if(!waSent){toast('📱 Enviá el resumen por WhatsApp para continuar');return;}
-    $('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();
-  }
-});
+function cerrarWaModal(){$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();}
+$('waBg').addEventListener('click',e=>{if(e.target===$('waBg'))cerrarWaModal();});
+$('waClose').addEventListener('click',()=>cerrarWaModal());
 $('waBtn').addEventListener('click',()=>{
   waSent=true;
   toast('✅ WhatsApp abierto. Enviá el mensaje y volvé.',4000);
-  setTimeout(()=>{$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();},2500);
+  setTimeout(()=>cerrarWaModal(),2500);
 });
 
 // ═══════════════════ PDF GENERATION ══════════════════
@@ -796,6 +818,19 @@ async function generarYSubirPDF(pedidos,turno,rep){
 
 // ═══════════════════ EVENTS ══════════════════════════
 $('mOk').addEventListener('click',confirmDel);
+$('undoBtn').addEventListener('click',async()=>{
+  if(S.mi<0||S.lk)return;
+  const p=S.peds[S.mi];if(!p||!p.entregado)return;
+  // Revertir entrega completamente
+  p.entregado=false;p.formaPago1='';p.importePagado1=0;
+  p.formaPago2='';p.importePagado2=0;p.comprobanteId='';
+  p.devolucion=false;p.notasDevolucion='';
+  closeM();render();cL();
+  push1(p); // fire & forget a Firebase
+  try{await gp({action:'guardarDatosReparto',pedidos:[p]});}
+  catch(e){qR(p);}
+  toast('↩ Entrega deshecha — podés volver a registrarla');
+});
 $('mX').addEventListener('click',closeM);
 $('lkClose').addEventListener('click',closeM);
 $('mBg').addEventListener('click',e=>{if(e.target===$('mBg'))closeM();});
