@@ -703,7 +703,7 @@ async function confirmDel(){
 
   p.formaPago1=fp1;p.importePagado1=a1;p.formaPago2=fp2;p.importePagado2=a2;
   p.devolucion=isDev;p.notasDevolucion=notes;
-  p.entregado=true;S.sav=true;closeM();render();
+  p.entregado=true;p.confirmedAt=new Date().toISOString();S.sav=true;closeM();render();
   vib(80); // haptic feedback
 
   // localStorage PRIMERO — seguro aunque no haya señal
