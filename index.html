@@ -156,6 +156,30 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 .mlk.show{display:flex}
 .mlk-btn{padding:10px 24px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--sf2);font-family:var(--f);font-weight:600;cursor:pointer;font-size:.88rem}
 
+/* ── INFORME IA MODAL ── */
+.ia-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:350;display:none;align-items:flex-end;justify-content:center;backdrop-filter:blur(3px)}
+.ia-bg.open{display:flex}
+.ia-sheet{background:var(--sf);border-radius:22px 22px 0 0;width:100%;max-width:520px;max-height:92dvh;display:flex;flex-direction:column;animation:su .28s cubic-bezier(.33,1,.68,1)}
+.ia-header{flex-shrink:0;padding:14px 18px 10px;border-bottom:1px solid var(--bd)}
+.ia-handle{width:36px;height:4px;border-radius:2px;background:var(--bd);margin:0 auto 12px}
+.ia-badge{display:inline-flex;align-items:center;gap:6px;background:linear-gradient(135deg,#eff4ff,#e0f2fe);border:1px solid #bfdbfe;border-radius:999px;padding:4px 10px;font-size:.72rem;font-weight:700;color:#1e40af;margin-bottom:8px;letter-spacing:.02em}
+.ia-badge::before{content:'✦';font-size:.7rem}
+.ia-title{font-size:1rem;font-weight:700;color:var(--tx);margin-bottom:2px}
+.ia-sub{font-size:.78rem;color:var(--tx3)}
+.ia-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:16px 18px;overscroll-behavior:contain}
+.ia-body{font-size:.88rem;line-height:1.7;color:var(--tx2);white-space:pre-wrap;word-break:break-word}
+.ia-footer{flex-shrink:0;padding:12px 18px calc(12px + var(--sab));border-top:1px solid var(--bd);background:var(--sf)}
+.ia-scroll-hint{text-align:center;font-size:.76rem;color:var(--tx3);margin-bottom:8px;transition:opacity .3s}
+.ia-scroll-hint.hidden{opacity:0;pointer-events:none}
+.ia-btn{width:100%;padding:13px;border:none;border-radius:var(--rs);background:var(--ac);color:#fff;font-family:var(--f);font-size:.92rem;font-weight:700;cursor:pointer;opacity:.35;pointer-events:none;transition:opacity .3s,transform .1s}
+.ia-btn.ready{opacity:1;pointer-events:auto}
+.ia-btn.ready:active{transform:scale(.97)}
+.ia-metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.ia-metric{background:var(--sf2);border:1px solid var(--bd);border-radius:var(--rs);padding:10px 12px;text-align:center}
+.ia-metric .mv{font-size:1.15rem;font-weight:700;color:var(--tx)}
+.ia-metric .ml{font-size:.67rem;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.04em;margin-top:1px}
+.ia-divider{height:1px;background:var(--bd);margin:14px 0}
+
 /* ── CONFIRM MODAL ── */
 .cfm-bg{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(2px)}
 .cfm-bg.open{display:flex}
@@ -261,6 +285,10 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 <div class="cfm" style="max-width:380px;text-align:left">
   <h3 style="text-align:center">✅ Rendición enviada</h3>
   <div id="waResumen" style="font-size:.82rem;color:var(--tx2);max-height:40vh;overflow-y:auto;margin-bottom:14px;white-space:pre-line;line-height:1.5;background:var(--sf2);border-radius:var(--rs);padding:10px 12px;border:1px solid var(--bd)"></div>
+  <div id="copiloto" style="display:none;margin-bottom:14px;padding:11px 13px;background:linear-gradient(135deg,#eef2ff 0%,#f0fdf4 100%);border-radius:var(--rs);border-left:3px solid #6366f1">
+    <div style="font-size:.68rem;font-weight:800;color:#6366f1;text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px">✈️ Copiloto Mercado Limpio</div>
+    <div id="copilotoTxt" style="font-size:.86rem;line-height:1.55;color:var(--tx)"></div>
+  </div>
   <a id="waBtn" href="#" target="_blank" style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px;border:none;border-radius:var(--rs);background:#25D366;color:#fff;font-family:var(--f);font-size:.92rem;font-weight:700;text-decoration:none;text-align:center">
     📱 Enviar por WhatsApp
   </a>
@@ -276,6 +304,27 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
   <button id="installBtn" style="width:100%;padding:13px;border:none;border-radius:var(--rs);background:var(--ac);color:#fff;font-family:var(--f);font-size:.95rem;font-weight:700;cursor:pointer;margin-bottom:8px">Instalar ahora</button>
   <button id="installLater" style="width:100%;padding:10px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--sf2);color:var(--tx2);font-family:var(--f);font-size:.85rem;font-weight:500;cursor:pointer">Más tarde</button>
 </div>
+</div>
+
+<!-- ── INFORME IA MODAL ── -->
+<div class="ia-bg" id="iaBg">
+  <div class="ia-sheet">
+    <div class="ia-header">
+      <div class="ia-handle"></div>
+      <div class="ia-badge">Informe IA · Reparto anterior</div>
+      <div class="ia-title" id="iaTitle">Análisis de tu último reparto</div>
+      <div class="ia-sub" id="iaSub">Leé el informe antes de comenzar</div>
+    </div>
+    <div class="ia-scroll" id="iaScroll">
+      <div class="ia-metrics" id="iaMetrics"></div>
+      <div class="ia-divider"></div>
+      <div class="ia-body" id="iaBody"></div>
+    </div>
+    <div class="ia-footer">
+      <div class="ia-scroll-hint" id="iaHint">↓ Deslizá hasta el final para continuar</div>
+      <button class="ia-btn" id="iaBtn">Entendido, empezar reparto →</button>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -374,6 +423,17 @@ async function startApp(){
     if(d&&Object.keys(d).length>0){S.peds=Object.values(d);render();hLoad();ok=true;toast('📦 Cargado');}}catch(_){}
   // 2) localStorage
   if(!ok){const c=localStorage.getItem(`c_${fAR()}_${S.turno}`);if(c){try{S.peds=JSON.parse(c);render();hLoad();ok=true;toast('📱 Desde caché');}catch(_){}}}
+  // 2.5) Supabase — carga instantánea si el admin ya cargó el reparto hoy
+  if(!ok){try{
+    const _sb=await fetch('https://gjeyvbidomxzofcdycya.supabase.co/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
+      {headers:{'apikey':'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdqZXl2Ymlkb214em9mY2R5Y3lhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMjc5MzAsImV4cCI6MjA4ODgwMzkzMH0.B1mg_CNsl7Gx-MdTsXSqkUDPJwvpNiek7-lf_LeaeL4',
+               'Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdqZXl2Ymlkb214em9mY2R5Y3lhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMjc5MzAsImV4cCI6MjA4ODgwMzkzMH0.B1mg_CNsl7Gx-MdTsXSqkUDPJwvpNiek7-lf_LeaeL4'}});
+    if(_sb.ok){const _d=await _sb.json();
+      if(_d.length&&Array.isArray(_d[0].pedidos)&&_d[0].pedidos.length>0){
+        S.peds=_d[0].pedidos;await pushA();cL();render();hLoad();ok=true;toast('⚡ Cargado');
+      }
+    }
+  }catch(_){}}
   // 3) GAS — SOLO si no hay datos locales (esta llamada SÍ puede regenerar, pero solo si el turno NO está finalizado)
   if(!ok){try{const r=await gp({action:'obtenerDatosReparto',turno:S.turno,repartidor:S.rep});
     if(r&&r.isTurnoFinalizado){hLoad();S.peds=[];S.lk=true;render();toast('🔒 Finalizado',4000);try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}lockUI();return;}
@@ -705,6 +765,7 @@ $('cfmYes').addEventListener('click',async()=>{
       S.peds=[];S.lk=true;render();
       // Mostrar modal de WhatsApp con resumen
       showWaModal(snapshot);
+      pedirConsejoIA(snapshot,S.turno,S.rep,fAR()); // Copiloto — background, no bloquea
       // Background: generar PDF y subir a Drive (no bloquea al usuario)
       generarYSubirPDF(snapshot,S.turno,S.rep).catch(e=>console.warn('PDF bg error:',e));
     }else{toast('Error: '+(r?.message||'?'));toast('💾 Backup local disponible',5000);}}
@@ -716,7 +777,7 @@ $('cfmYes').addEventListener('click',async()=>{
 });
 
 let waSent=false;
-function cerrarWaModal(){$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');checkTS();}
+function cerrarWaModal(){$('waBg').classList.remove('open');$('turnoScreen').classList.add('show');$('copiloto').style.display='none';$('copilotoTxt').textContent='';checkTS();}
 $('waBg').addEventListener('click',e=>{if(e.target===$('waBg'))cerrarWaModal();});
 $('waClose').addEventListener('click',()=>cerrarWaModal());
 $('waBtn').addEventListener('click',()=>{
@@ -724,6 +785,19 @@ $('waBtn').addEventListener('click',()=>{
   toast('✅ WhatsApp abierto. Enviá el mensaje y volvé.',4000);
   setTimeout(()=>cerrarWaModal(),2500);
 });
+
+const CF_WORKER='https://gestiondereparto.santamariapablodaniel.workers.dev';
+async function pedirConsejoIA(pedidos,turno,rep,fecha){
+  try{
+    const res=await fetch(CF_WORKER+'/consejo-turno',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({repartidor:rep,turno,fecha,pedidos})
+    });
+    const d=await res.json();
+    if(d.consejo){$('copilotoTxt').textContent=d.consejo;$('copiloto').style.display='block';}
+  }catch(_){}
+}
 
 // ═══════════════════ PDF GENERATION ══════════════════
 async function generarYSubirPDF(pedidos,turno,rep){
