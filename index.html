@@ -263,6 +263,9 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 .tb-body{flex:1}
 .tb-title{font-size:.95rem;font-weight:700}
 .tb .sub{font-size:.74rem;font-weight:400;color:rgba(255,255,255,.7);margin-top:2px}
+.tb.tb-loading{opacity:.55;pointer-events:none}
+.tb.tb-loading .sub{animation:tsc-pulse 1.1s ease-in-out infinite;color:rgba(255,255,255,.55)!important}
+@keyframes tsc-pulse{0%,100%{opacity:.2}50%{opacity:1}}
 .tsc-wave{position:absolute;bottom:0;left:0;right:0;height:80px;background:var(--bg);border-radius:28px 28px 0 0;pointer-events:none}
 .sdot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:3px}
 .sdot.ok{background:var(--ok)}.sdot.sync{background:var(--wn);animation:pu 1s infinite}.sdot.off{background:var(--dg)}
@@ -283,7 +286,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
   <div class="tsc-greeting">Bienvenido,</div>
   <div class="tsc-name" id="tscName">Repartidor</div>
   <div class="tsc-date" id="tscDate"></div>
-  <div class="tsc-label">Seleccioná tu turno</div>
+  <div class="tsc-label" id="tscLabel">Buscando turnos disponibles…</div>
   <div class="tsc-btns">
     <button class="tb" id="turnoM">
       <span class="tb-icon">☀️</span>
@@ -480,6 +483,11 @@ function showTS(){
   const dias=['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
   const meses=['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
   const now=new Date();$('tscDate').textContent=`${dias[now.getDay()]} ${now.getDate()} de ${meses[now.getMonth()]}`;
+  // Botones en estado cargando hasta que lleguen los datos
+  [$('turnoM'),$('turnoT')].forEach(b=>{b.classList.add('tb-loading');b.disabled=false;});
+  $('tMS').textContent='Verificando disponibilidad…';$('tMS').style.color='';
+  $('tTS').textContent='Verificando disponibilidad…';$('tTS').style.color='';
+  $('tscLabel').textContent='Buscando turnos disponibles…';
   checkTS();$('turnoM').onclick=()=>selT('Mañana');$('turnoT').onclick=()=>selT('Tarde');
 }
 
@@ -491,14 +499,17 @@ async function checkTS(){
 }
 
 function applyTB(e){
+  // Quitar estado loading en ambos botones
+  $('turnoM').classList.remove('tb-loading');
+  $('turnoT').classList.remove('tb-loading');
+  $('tscLabel').textContent='Seleccioná tu turno';
   ['Mañana','Tarde'].forEach(t=>{
     const st=e[t]||'sinDatos',b=t==='Mañana'?$('turnoM'):$('turnoT'),s=t==='Mañana'?$('tMS'):$('tTS');
-    if(st==='finalizado'){b.disabled=true;s.textContent='🔒 Rendición enviada';s.style.color='#d4302f';}
-    else if(st==='abierto'){b.disabled=false;s.textContent='📦 Reparto activo — listo para empezar';s.style.color='#0d9f57';}
-    else{b.disabled=true;s.textContent='Sin reparto cargado';s.style.color='#8990a3';}
+    if(st==='finalizado'){b.disabled=true;s.textContent='🔒 Rendición enviada';s.style.color='rgba(255,100,100,.9)';}
+    else if(st==='abierto'){b.disabled=false;s.textContent='📦 Reparto activo — listo para empezar';s.style.color='rgba(110,231,183,.9)';}
+    else{b.disabled=true;s.textContent='Sin reparto cargado';s.style.color='rgba(255,255,255,.35)';}
   });
   if(e['Mañana']==='finalizado'&&e['Tarde']==='finalizado')toast('🟢 Jornada completa — ambos turnos finalizados',5000);
-  // Si ambos sin datos
   if((e['Mañana']||'sinDatos')==='sinDatos'&&(e['Tarde']||'sinDatos')==='sinDatos')toast('No hay repartos cargados para hoy',4000);
 }
 
