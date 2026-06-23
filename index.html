@@ -712,6 +712,9 @@ async function confirmDel(){
   push1(p);
   toast(fp1==='No pagó'?'🚫 Entregado (sin pago)':'✅ Entregado');
 
+  // Monitor en tiempo real: actualizar Supabase directo vía Worker (fire & forget)
+  fetch(CF_WORKER+'/update-entrega',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:fAR(),turno:S.turno,pedidos:S.peds})}).catch(()=>{});
+
   // Guardar en GAS (background) — si falla, encolar
   try{await gp({action:'guardarDatosReparto',pedidos:[p]});}
   catch(e){qR(p);console.warn('GAS save queued:',e);}
