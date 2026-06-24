@@ -925,8 +925,8 @@ function showRendBg(){
 }
 function updateRendCopiloto(consejo,offline){
   $('rendCopilotoTxt').textContent=consejo;
-  $('rendCpNote').style.display=offline?'':'none';
-  $('rendCopiloto').style.display='';
+  $('rendCpNote').style.display=offline?'block':'none';
+  $('rendCopiloto').style.display='block';
 }
 function completeRendBg(waUrl){
   $('rendPhase1').style.display='none';$('rendPhase2').style.display='';
