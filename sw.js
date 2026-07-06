@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reparto-ml-v11';
+const CACHE_NAME = 'reparto-ml-v12';
 const STATIC_ASSETS = [
   './manifest.json',
   './icon-192.png',

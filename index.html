@@ -756,7 +756,7 @@ async function fR(){
     if(rqNow.length===0&&pqNow.length===0){
       try{
         const r=await gp({action:'enviarRendicion',repartidor:rp.rep,turno:rp.turno},30000);
-        if(r&&r.message){
+        if(r&&r.success){
           localStorage.removeItem('rendicion_pending');
           localStorage.removeItem(`c_${rp.fecha}_${rp.turno}`);
           try{await db.ref('estado/'+rp.fecha+'/'+rp.turno).set('finalizado');}catch(_){}
@@ -893,7 +893,7 @@ $('cfmYes').addEventListener('click',async()=>{
 
   try{
     const r=await gp({action:'enviarRendicion',repartidor:S.rep,turno:S.turno},30000);
-    if(r&&r.message){
+    if(r&&r.success){
       localStorage.removeItem(`c_${fAR()}_${S.turno}`);
       localStorage.removeItem(backupKey);
       try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}
@@ -908,7 +908,7 @@ $('cfmYes').addEventListener('click',async()=>{
       generarYSubirPDF(snapshot,S.turno,S.rep).catch(e=>console.warn('PDF bg error:',e));
     }else{
       hideRendBg();
-      toast('Error enviando rendición');
+      toast('Error enviando rendición: '+(r&&r.message||'desconocido'),6000);
     }
   }catch(e){
     hideRendBg();
