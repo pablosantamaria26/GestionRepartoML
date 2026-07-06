@@ -346,13 +346,19 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 <div class="cfm-btns"><button class="cfm-cancel" id="cfmNo">Cancelar</button><button class="cfm-ok" id="cfmYes">Confirmar</button></div></div>
 </div>
 
+<!-- ── MODAL PERSISTENTE: rendición pendiente de envío ── -->
+<div class="cfm-bg" id="rendFailBg">
+<div class="cfm"><h3>⚠️ Rendición pendiente de envío</h3><p id="rendFailMsg">Tu última rendición no se pudo enviar. Reintentá para completarla.</p>
+<div class="cfm-btns"><button class="cfm-ok" id="rendFailRetry" style="flex:1">Reintentar envío</button></div></div>
+</div>
+
 <!-- ── RENDICIÓN OVERLAY ── -->
 <div class="rend-bg" id="rendBg">
   <div class="rend-sheet">
     <div id="rendPhase1">
       <div class="rend-spin"></div>
-      <div class="rend-title">Enviando rendición…</div>
-      <div class="rend-sub">No cierres esta pantalla</div>
+      <div class="rend-title">Generando tu rendición…</div>
+      <div class="rend-sub">Mientras tanto, leé el consejo de tu Copiloto 👇 — cuando esté lista te aviso.</div>
     </div>
     <div id="rendPhase2" style="display:none">
       <div class="rend-ok">✅</div>
@@ -759,10 +765,12 @@ async function fR(){
         if(r&&r.success){
           localStorage.removeItem('rendicion_pending');
           localStorage.removeItem(`c_${rp.fecha}_${rp.turno}`);
+          localStorage.removeItem(`backup_${rp.fecha}_${rp.turno}`);
           try{await db.ref('estado/'+rp.fecha+'/'+rp.turno).set('finalizado');}catch(_){}
           try{await db.ref('reparto/'+rp.fecha+'/'+rp.turno).remove();}catch(_){}
           S.lk=true;S.peds=[];render();
-          toast('✅ Rendición enviada automáticamente. ¡Todo sincronizado!',5000);
+          cerrarRendFail(); // cerrar el modal persistente si estaba abierto
+          toast('✅ Rendición enviada correctamente. ¡Todo sincronizado!',5000);
         }
       }catch(_){console.warn('Rendición retry failed, reintento en 30s');}
     }
@@ -896,6 +904,7 @@ $('cfmYes').addEventListener('click',async()=>{
     if(r&&r.success){
       localStorage.removeItem(`c_${fAR()}_${S.turno}`);
       localStorage.removeItem(backupKey);
+      localStorage.removeItem('rendicion_pending'); // limpiar cualquier pendiente previo
       try{await db.ref(fbE()+'/'+S.turno).set('finalizado');}catch(_){}
       try{await db.ref(fbP()).remove();}catch(_){}
       S.peds=[];S.lk=true;render();
@@ -907,12 +916,16 @@ $('cfmYes').addEventListener('click',async()=>{
       completeRendBg(waUrl);
       generarYSubirPDF(snapshot,S.turno,S.rep).catch(e=>console.warn('PDF bg error:',e));
     }else{
+      // Fallo del servidor: dejar la rendición recuperable (misma red de seguridad que un error de red)
       hideRendBg();
-      toast('Error enviando rendición: '+(r&&r.message||'desconocido'),6000);
+      try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
+          localStorage.setItem(backupKey,JSON.stringify(snapshot));}catch(_){}
+      toast('Error enviando rendición: '+(r&&r.message||'desconocido')+'. Quedó pendiente, la reintentás al reabrir.',6000);
     }
   }catch(e){
     hideRendBg();
-    try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));}catch(_){}
+    try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
+        localStorage.setItem(backupKey,JSON.stringify(snapshot));}catch(_){}
     toast('📴 Sin señal. La rendición se enviará automáticamente cuando vuelva internet.',6000);
   }
 });
@@ -934,6 +947,30 @@ function completeRendBg(waUrl){
   $('rendActions').style.display='';
 }
 function hideRendBg(){$('rendBg').classList.remove('open');}
+
+// ═══════════ MODAL PERSISTENTE: rendición pendiente ═══════════
+function cerrarRendFail(){$('rendFailBg').classList.remove('open');}
+// Se llama al arrancar la app: si hay una rendición que nunca se confirmó, avisa y ofrece reintentar.
+function checkRendicionPendiente(){
+  const rp=JSON.parse(localStorage.getItem('rendicion_pending')||'null');
+  if(!rp)return;
+  $('rendFailMsg').textContent=`Tu rendición del turno ${rp.turno||'—'}${rp.fecha?' ('+rp.fecha+')':''} no se envió. Reintentá para completarla — no perdés nada.`;
+  $('rendFailRetry').disabled=false;$('rendFailRetry').textContent='Reintentar envío';
+  $('rendFailBg').classList.add('open');
+}
+$('rendFailRetry').addEventListener('click',async()=>{
+  if(!navigator.onLine){
+    $('rendFailMsg').textContent='📴 Sin señal — quedó en cola. Se enviará solo cuando vuelva internet (podés cerrar y volver más tarde).';
+    return;
+  }
+  $('rendFailRetry').disabled=true;$('rendFailRetry').textContent='Reintentando…';
+  await fR(); // flush ordenado rq→pq→rendición; si tiene éxito, cerrarRendFail() lo cierra desde fR()
+  // Si sigue pendiente después del intento, restaurar el botón para poder reintentar de nuevo
+  if(localStorage.getItem('rendicion_pending')){
+    $('rendFailRetry').disabled=false;$('rendFailRetry').textContent='Reintentar envío';
+    toast('Todavía no se pudo enviar. Reintentá en un momento.',5000);
+  }
+});
 
 $('rendCerrar').addEventListener('click',()=>{hideRendBg();$('turnoScreen').classList.add('show');$('cpTab').classList.add('show');checkTS();});
 $('rendWaBtn').addEventListener('click',()=>{toast('✅ WhatsApp abierto.',3000);setTimeout(()=>{hideRendBg();$('turnoScreen').classList.add('show');$('cpTab').classList.add('show');checkTS();},2500);});
@@ -1152,6 +1189,7 @@ if(window.matchMedia('(display-mode: standalone)').matches||window.navigator.sta
 }
 
 initLogin();
+checkRendicionPendiente(); // red de seguridad: avisa si quedó una rendición sin enviar
 if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(_=>{});
 window.openModal=openModal;window.uOrd=uOrd;
 </script>
