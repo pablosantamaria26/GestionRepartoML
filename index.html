@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="utf-8"/>
@@ -594,7 +594,7 @@ function cL(){
     if(S.rep&&S.turno)localStorage.setItem(`last_${S.rep}_${S.turno}`,JSON.stringify(S.peds));
   }catch(_){}
 }
-let gst=null;function sGas(){clearTimeout(gst);gst=setTimeout(async()=>{try{await gp({action:'guardarDatosReparto',pedidos:S.peds});}catch(_){}},3000);}
+let gst=null;function sGas(){clearTimeout(gst);gst=setTimeout(async()=>{try{await gp({action:'guardarDatosReparto',pedidos:S.peds});}catch(_){setTimeout(async()=>{try{await gp({action:'guardarDatosReparto',pedidos:S.peds});}catch(_){}},20000);}},3000);}
 
 // ═══════════════════ RENDER ══════════════════════════
 let searchTerm='';
@@ -694,6 +694,7 @@ $('dTg').addEventListener('click',()=>{const c=!$('mDv').checked;$('mDv').checke
 // ═══════════════════ CONFIRM DELIVERY ════════════════
 async function confirmDel(){
   if(S.sav||S.mi<0)return;const p=S.peds[S.mi];
+  if(!p||p.entregado)return; // evitar doble confirmación
   // Gather modal data
   const fp1=S.fp1||'';const a1=fp1==='No pagó'?0:(S.a1||0);
   const fp2=S.fp2||'';const a2=S.a2||0;
@@ -709,22 +710,22 @@ async function confirmDel(){
 
   p.formaPago1=fp1;p.importePagado1=a1;p.formaPago2=fp2;p.importePagado2=a2;
   p.devolucion=isDev;p.notasDevolucion=notes;
-  p.entregado=true;p.confirmedAt=new Date().toISOString();S.sav=true;closeM();render();
-  vib(80); // haptic feedback
+  p.entregado=true;p.confirmedAt=new Date().toISOString();
+  S.sav=true;closeM();render();
+  vib(80);
 
   // localStorage PRIMERO — seguro aunque no haya señal
   cL();
-  // Firebase: fire & forget — SDK encola offline y sinc solo al reconectar
-  push1(p);
+  // Firebase: S.sav se libera cuando Firebase confirma (~200ms), no cuando GAS responde (~3-8s)
+  // Esto permite registrar el próximo cliente casi inmediatamente
+  push1(p).finally(()=>{S.sav=false;});
   toast(fp1==='No pagó'?'🚫 Entregado (sin pago)':'✅ Entregado');
 
-  // Monitor en tiempo real: actualizar Supabase directo vía Worker (fire & forget)
+  // Monitor: fire & forget
   fetch(CF_WORKER+'/update-entrega',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:fAR(),turno:S.turno,pedidos:S.peds})}).catch(()=>{});
 
-  // Guardar en GAS (background) — si falla, encolar
-  try{await gp({action:'guardarDatosReparto',pedidos:[p]});}
-  catch(e){qR(p);console.warn('GAS save queued:',e);}
-  S.sav=false;
+  // GAS: background sin bloquear UI — encola si falla
+  gp({action:'guardarDatosReparto',pedidos:[p]}).catch(()=>qR(p));
 }
 
 // ═══════════════════ OFFLINE QUEUE ═══════════════════
@@ -769,8 +770,16 @@ async function fR(){
           try{await db.ref('estado/'+rp.fecha+'/'+rp.turno).set('finalizado');}catch(_){}
           try{await db.ref('reparto/'+rp.fecha+'/'+rp.turno).remove();}catch(_){}
           S.lk=true;S.peds=[];render();
-          cerrarRendFail(); // cerrar el modal persistente si estaba abierto
+          cerrarRendFail();
           toast('✅ Rendición enviada correctamente. ¡Todo sincronizado!',5000);
+        }else if(r&&!r.success){
+          // El servidor rechazó por error de negocio (ej: clientes pendientes): cortar el retry loop
+          const errMsg=(r.message)||'Error al enviar';
+          if(errMsg.toLowerCase().includes('pendiente')){
+            localStorage.removeItem('rendicion_pending');
+            cerrarRendFail();
+            toast('⚠️ '+errMsg+'. Revisá la lista y enviá de nuevo.',8000);
+          }
         }
       }catch(_){console.warn('Rendición retry failed, reintento en 30s');}
     }
@@ -866,8 +875,47 @@ function showWaModal(pedidos){
   $('waBg').classList.add('open');
 }
 
-function sendRend(){
-  const pd=S.peds.filter(p=>!p.entregado&&!p.devolucion);if(pd.length>0)return toast('Quedan '+pd.length+' pendientes');
+async function sendRend(){
+  const pd=S.peds.filter(p=>!p.entregado&&!p.devolucion);
+  if(pd.length>0){
+    // Limpiar buscador si estaba filtrando (para que el cliente pendiente sea visible)
+    if(searchTerm){searchTerm='';$('searchIn').value='';render();}
+    const pendIdx=S.peds.indexOf(pd[0]);
+    const nombres=pd.slice(0,2).map(p=>p.nombre||'Cliente').join(', ')+(pd.length>2?' y '+(pd.length-2)+' más':'');
+    toast(pd.length===1
+      ?'Falta registrar a '+nombres+'. Abriendo cliente...'
+      :'Quedan '+pd.length+' sin registrar: '+nombres+'. Completalos y volvé a enviar.'
+    ,6000);
+    // Scrollear a la tarjeta del primer pendiente
+    setTimeout(()=>{
+      const card=document.querySelector('[data-ri="'+pendIdx+'"]');
+      if(card)card.scrollIntoView({behavior:'smooth',block:'center'});
+      // Si hay exactamente 1 pendiente, abrir el modal directamente
+      if(pd.length===1)openModal(pendIdx);
+    },150);
+    return;
+  }
+
+  // Cross-check con Supabase: detectar clientes que el admin agregó después que el repartidor cargó la sesión
+  $('bSn').disabled=true;
+  try{
+    const sb=await fetch(SB_URL+'/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
+      {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(3000)});
+    if(sb.ok){
+      const d=await sb.json();
+      if(d.length&&Array.isArray(d[0].pedidos)){
+        const localNums=new Set(S.peds.map(p=>String(p.numeroCliente)));
+        const faltantes=d[0].pedidos.filter(p=>!localNums.has(String(p.numeroCliente)));
+        if(faltantes.length>0){
+          S.peds=[...S.peds,...faltantes];
+          cL();render();
+          toast('⚠️ '+faltantes.length+' cliente(s) sin registrar encontrado(s). Completá y volvé a enviar.',7000);
+          return;
+        }
+      }
+    }
+  }catch(_){}finally{uUI();}
+
   const rq=JSON.parse(localStorage.getItem('rq')||'[]');
   const pq=JSON.parse(localStorage.getItem('pq')||'[]');
   if(rq.length>0||pq.length>0){
@@ -916,11 +964,42 @@ $('cfmYes').addEventListener('click',async()=>{
       completeRendBg(waUrl);
       generarYSubirPDF(snapshot,S.turno,S.rep).catch(e=>console.warn('PDF bg error:',e));
     }else{
-      // Fallo del servidor: dejar la rendición recuperable (misma red de seguridad que un error de red)
       hideRendBg();
-      try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
-          localStorage.setItem(backupKey,JSON.stringify(snapshot));}catch(_){}
-      toast('Error enviando rendición: '+(r&&r.message||'desconocido')+'. Quedó pendiente, la reintentás al reabrir.',6000);
+      const msg=(r&&r.message)||'desconocido';
+      if(msg.toLowerCase().includes('pendiente')){
+        toast('⚠️ '+msg,6000);
+        try{
+          const r2=await gp({action:'obtenerDatosReparto',turno:S.turno,repartidor:S.rep},10000);
+          if(r2&&Array.isArray(r2.pedidos)){
+            const localNums=new Set(S.peds.map(p=>String(p.numeroCliente)));
+            const faltantes=r2.pedidos.filter(p=>!localNums.has(String(p.numeroCliente)));
+            if(faltantes.length>0){
+              // Caso A: hay clientes que la app no tenía — agregar y mostrar para registrar
+              S.peds=[...S.peds,...faltantes];cL();render();
+              toast('Se encontraron '+faltantes.length+' cliente(s) que faltaban. Registrá y enviá de nuevo.',8000);
+            }else{
+              // Caso B: la app tiene todo registrado pero GAS no lo recibió (señal cortada)
+              // Re-enviar todos los entregados para que GAS quede sincronizado
+              const entregados=S.peds.filter(p=>p.entregado||p.devolucion);
+              if(entregados.length>0){
+                try{
+                  await gp({action:'guardarDatosReparto',pedidos:entregados},20000);
+                  toast('✅ Datos reenviados al servidor. Volvé a tocar "Enviar Rendición".',7000);
+                }catch(_){
+                  toast('Sin señal para sincronizar. Verificá internet y volvé a intentar.',6000);
+                }
+              }
+            }
+          }
+        }catch(_){
+          toast('No se pudo verificar con el servidor. Verificá tu conexión.',6000);
+        }
+      }else{
+        // Error de red u otro: guardar para reintentar automáticamente
+        try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
+            localStorage.setItem(`backup_${fAR()}_${S.turno}`,JSON.stringify(snapshot));}catch(_){}
+        toast('Error enviando rendición: '+msg+'. Quedó pendiente, la reintentás al reabrir.',6000);
+      }
     }
   }catch(e){
     hideRendBg();
@@ -951,9 +1030,24 @@ function hideRendBg(){$('rendBg').classList.remove('open');}
 // ═══════════ MODAL PERSISTENTE: rendición pendiente ═══════════
 function cerrarRendFail(){$('rendFailBg').classList.remove('open');}
 // Se llama al arrancar la app: si hay una rendición que nunca se confirmó, avisa y ofrece reintentar.
-function checkRendicionPendiente(){
+// Antes de mostrar el aviso, verifica en Supabase si esa rendición ya se había enviado en realidad
+// (puede pasar que GAS termine de procesarla después de que el celular ya perdió la respuesta por timeout/corte de señal).
+async function checkRendicionPendiente(){
   const rp=JSON.parse(localStorage.getItem('rendicion_pending')||'null');
   if(!rp)return;
+  try{
+    const sb=await fetch(SB_URL+'/rest/v1/rendiciones_reparto?fecha=eq.'+rp.fecha+'&turno=eq.'+encodeURIComponent(rp.turno)+'&repartidor=eq.'+encodeURIComponent(rp.rep)+'&select=fecha',
+      {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(4000)});
+    if(sb.ok){
+      const d=await sb.json();
+      if(d.length>0){
+        // Ya estaba enviada de verdad: limpiar el flag sin tocar el reparto actual y no mostrar el aviso.
+        localStorage.removeItem('rendicion_pending');
+        localStorage.removeItem(`backup_${rp.fecha}_${rp.turno}`);
+        return;
+      }
+    }
+  }catch(_){/* sin señal o Supabase no respondió: seguimos con el aviso normal, no perdemos el flag */}
   $('rendFailMsg').textContent=`Tu rendición del turno ${rp.turno||'—'}${rp.fecha?' ('+rp.fecha+')':''} no se envió. Reintentá para completarla — no perdés nada.`;
   $('rendFailRetry').disabled=false;$('rendFailRetry').textContent='Reintentar envío';
   $('rendFailBg').classList.add('open');
