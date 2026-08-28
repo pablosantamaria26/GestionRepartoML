@@ -797,18 +797,30 @@ setInterval(()=>{
 
 // ═══════════════════ PHOTOS ══════════════════════════
 function compImg(f,mw=1024,q=0.7){return new Promise((res,rej)=>{const im=new Image(),u=URL.createObjectURL(f);im.onload=()=>{URL.revokeObjectURL(u);let w=im.width,h=im.height;if(w>mw){h=Math.round(h*mw/w);w=mw;}const cv=document.createElement('canvas');cv.width=w;cv.height=h;cv.getContext('2d').drawImage(im,0,0,w,h);cv.toBlob(b=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(b);},'image/jpeg',q);};im.onerror=rej;im.src=u;});}
+function encolarFotoPendiente_(p,f){
+  // ID temporal: permite confirmar entrega con Transferencia aunque no haya subido aún
+  try{
+    if(!p.comprobanteId){p.comprobanteId='pending_'+p.numeroCliente;cL();render();}
+    const q=JSON.parse(localStorage.getItem('pq')||'[]');
+    const r2=new FileReader();r2.onload=e=>{q.push({b:e.target.result.split(',')[1],n:p.numeroCliente});localStorage.setItem('pq',JSON.stringify(q));};
+    r2.readAsDataURL(f);
+  }catch(_){}
+}
 async function hPhoto(f){if(!f||S.mi<0)return;const p=S.peds[S.mi];sLoad('Comprimiendo...');
-  try{const b=await compImg(f);sLoad('Subiendo...');const r=await gp({action:'subirComprobante',base64:b,numeroCliente:p.numeroCliente},30000);
-    if(r&&r.fileId){p.comprobanteId=r.fileId;push1(p);cL();render();toast('📷 Foto subida');}else toast('Error');}
+  try{
+    const b=await compImg(f);sLoad('Subiendo...');
+    const r=await gp({action:'subirComprobante',base64:b,numeroCliente:p.numeroCliente},30000);
+    if(r&&r.fileId){p.comprobanteId=r.fileId;push1(p);cL();render();toast('📷 Foto subida');}
+    else{
+      // El servidor respondió pero sin fileId (falló subirComprobanteImagen del lado de GAS).
+      // No dejamos al repartidor trabado: encolamos la foto igual que si no hubiera señal.
+      encolarFotoPendiente_(p,f);
+      toast('⚠️ '+((r&&r.message)||'No se pudo subir')+'. Foto guardada, se reintenta sola.',6000);
+    }
+  }
   catch(_){
     toast('📷 Sin señal — foto guardada, se sube automáticamente');
-    try{
-      // ID temporal: permite confirmar entrega con Transferencia aunque no haya subido aún
-      if(!p.comprobanteId){p.comprobanteId='pending_'+p.numeroCliente;cL();render();}
-      const q=JSON.parse(localStorage.getItem('pq')||'[]');
-      const r2=new FileReader();r2.onload=e=>{q.push({b:e.target.result.split(',')[1],n:p.numeroCliente});localStorage.setItem('pq',JSON.stringify(q));};
-      r2.readAsDataURL(f);
-    }catch(_){}
+    encolarFotoPendiente_(p,f);
   }hLoad();}
 
 // ═══════════════════ BOTTOM BAR ══════════════════════
