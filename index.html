@@ -269,7 +269,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 @keyframes tsc-pulse{0%,100%{opacity:.2}50%{opacity:1}}
 .tsc-wave{display:none}
 .sdot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:3px}
-.sdot.ok{background:var(--ok)}.sdot.sync{background:var(--wn);animation:pu 1s infinite}.sdot.off{background:var(--dg)}
+.sdot.ok{background:var(--ok)}.sdot.sync{background:var(--wn);animation:pu 1s infinite}.sdot.off{background:var(--dg)}.sdot.pend{background:var(--wn);animation:pu 1s infinite}
 @keyframes pu{0%,100%{opacity:.4}50%{opacity:1}}
 </style>
 </head>
@@ -457,7 +457,16 @@ const fbE=()=>`estado/${fAR()}`;
 function toast(m,ms=3000){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove('show'),ms);}
 function sLoad(t){$('ldTx').textContent=t;$('ldBg').classList.add('show');}
 function hLoad(){$('ldBg').classList.remove('show');}
-function sSync(s){$('sDot').className='sdot '+s;$('sLbl').textContent=s==='ok'?'Sincronizado':s==='sync'?'Sincronizando...':'Offline';}
+function sSync(s,n){$('sDot').className='sdot '+s;$('sLbl').textContent=s==='ok'?'Sincronizado':s==='sync'?'Sincronizando...':s==='pend'?(n+' pendiente'+(n>1?'s':'')+' de servidor'):'Offline';}
+// Refleja en el puntito si hay algo esperando llegar a GAS (no solo si Firebase escribió bien).
+// No pisa el estado 'off' (offline ya es más informativo que "pendiente").
+function uSyncBadge(){
+  if(!navigator.onLine)return;
+  const n=(JSON.parse(localStorage.getItem('rq')||'[]')).length
+    +(JSON.parse(localStorage.getItem('pq')||'[]')).length
+    +(localStorage.getItem('rendicion_pending')?1:0);
+  if(n>0)sSync('pend',n);else if($('sDot').className.indexOf('off')<0)sSync('ok');
+}
 
 // ═══════════════════ GAS POST ════════════════════════
 async function gp(body,to=15000){
@@ -729,7 +738,7 @@ async function confirmDel(){
 }
 
 // ═══════════════════ OFFLINE QUEUE ═══════════════════
-function qR(p){try{const q=JSON.parse(localStorage.getItem('rq')||'[]');q.push({...p,_queuedAt:Date.now()});localStorage.setItem('rq',JSON.stringify(q));toast('💾 Guardado offline, se subirá automáticamente');}catch(_){}}
+function qR(p){try{const q=JSON.parse(localStorage.getItem('rq')||'[]');q.push({...p,_queuedAt:Date.now()});localStorage.setItem('rq',JSON.stringify(q));toast('💾 Guardado offline, se subirá automáticamente');uSyncBadge();}catch(_){}}
 
 async function fR(){
   // Flush pedidos queue
@@ -784,6 +793,7 @@ async function fR(){
       }catch(_){console.warn('Rendición retry failed, reintento en 30s');}
     }
   }
+  uSyncBadge();
 }
 
 // Auto-retry every 30s if there's queued data
@@ -802,7 +812,7 @@ function encolarFotoPendiente_(p,f){
   try{
     if(!p.comprobanteId){p.comprobanteId='pending_'+p.numeroCliente;cL();render();}
     const q=JSON.parse(localStorage.getItem('pq')||'[]');
-    const r2=new FileReader();r2.onload=e=>{q.push({b:e.target.result.split(',')[1],n:p.numeroCliente});localStorage.setItem('pq',JSON.stringify(q));};
+    const r2=new FileReader();r2.onload=e=>{q.push({b:e.target.result.split(',')[1],n:p.numeroCliente});localStorage.setItem('pq',JSON.stringify(q));uSyncBadge();};
     r2.readAsDataURL(f);
   }catch(_){}
 }
@@ -1296,6 +1306,7 @@ if(window.matchMedia('(display-mode: standalone)').matches||window.navigator.sta
 
 initLogin();
 checkRendicionPendiente(); // red de seguridad: avisa si quedó una rendición sin enviar
+uSyncBadge(); // refleja de entrada si quedó algo pendiente de una sesión anterior
 if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(_=>{});
 window.openModal=openModal;window.uOrd=uOrd;
 </script>
