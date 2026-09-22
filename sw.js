@@ -1,5 +1,7 @@
-const CACHE_NAME = 'reparto-ml-v13';
+const CACHE_NAME = 'reparto-ml-v14';
 const STATIC_ASSETS = [
+  './',
+  './index.html',
   './manifest.json',
   './icon-192.png',
   'https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@600&display=swap',
@@ -46,7 +48,15 @@ self.addEventListener('fetch', event => {
           caches.open(CACHE_NAME).then(cache => cache.put(event.request, response.clone()));
           return response;
         })
-        .catch(() => caches.match('./index.html'))
+        .catch(() => caches.match('./index.html').then(cached => cached || caches.match('./')).then(cached =>
+          cached || new Response(
+            '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+            '<body style="font-family:sans-serif;background:#0f1220;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:24px">' +
+            '<div><h2>📴 Sin señal</h2><p>No se pudo cargar la app. Volvé a intentar cuando tengas conexión.</p>' +
+            '<button onclick="location.reload()" style="padding:12px 24px;border-radius:8px;border:none;background:#4f7cff;color:#fff;font-size:1rem">Reintentar</button></div>',
+            { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+          )
+        ))
     );
     return;
   }
