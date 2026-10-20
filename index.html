@@ -584,6 +584,7 @@ async function startApp(){
     if(r&&r.estado&&r.estado[S.turno]==='finalizado'){toast('🔒 Finalizado');S.lk=true;try{db.ref(fbE()+'/'+S.turno).set('finalizado');db.ref(fbP()).remove();}catch(_){}lockUI();}
   }).catch(_=>{});}
   setupSync();
+  if(ok)setTimeout(sumarNuevosOficina,2500);
 }
 function lockUI(){$('bSv').disabled=true;$('bRt').disabled=true;$('bSn').disabled=true;}
 
@@ -804,6 +805,32 @@ setInterval(()=>{
   const hasRP=!!localStorage.getItem('rendicion_pending');
   if(hasQ||hasPQ||hasRP)fR();
 },30000);
+
+// ═══════════ CLIENTES QUE LA OFICINA SUMA DESPUÉS ════════════
+// La lista del turno se baja una vez (y queda en Firebase). Si la oficina
+// agrega clientes después, solo aparecían al «Enviar rendición». Ahora se
+// consulta Supabase al abrir el turno, cada minuto y al volver a la app:
+// se SUMAN los clientes que falten (nunca se quita ni se pisa lo registrado).
+let _nuevosEnCurso=false;
+async function sumarNuevosOficina(){
+  if(_nuevosEnCurso||!S.turno||S.lk||S.sav||document.hidden||!navigator.onLine||!Array.isArray(S.peds))return;
+  _nuevosEnCurso=true;
+  try{
+    const sb=await fetch(SB_URL+'/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
+      {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(5000)});
+    if(!sb.ok)return;
+    const d=await sb.json();
+    if(!d.length||!Array.isArray(d[0].pedidos)||S.lk||S.sav)return;
+    const loc=new Set(S.peds.map(p=>String(p.numeroCliente)));
+    const nuevos=d[0].pedidos.filter(p=>p&&p.numeroCliente!=null&&String(p.numeroCliente).trim()&&!loc.has(String(p.numeroCliente)));
+    if(!nuevos.length)return;
+    S.peds=[...S.peds,...nuevos];
+    await pushA();cL();render();
+    toast('📦 La oficina sumó '+nuevos.length+' cliente'+(nuevos.length>1?'s':'')+': '+nuevos.map(p=>p.nombre||p.numeroCliente).join(', '),6000);
+  }catch(_){}finally{_nuevosEnCurso=false;}
+}
+setInterval(sumarNuevosOficina,60000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)sumarNuevosOficina();});
 
 // ═══════════════════ PHOTOS ══════════════════════════
 function compImg(f,mw=1024,q=0.7){return new Promise((res,rej)=>{const im=new Image(),u=URL.createObjectURL(f);im.onload=()=>{URL.revokeObjectURL(u);let w=im.width,h=im.height;if(w>mw){h=Math.round(h*mw/w);w=mw;}const cv=document.createElement('canvas');cv.width=w;cv.height=h;cv.getContext('2d').drawImage(im,0,0,w,h);cv.toBlob(b=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.readAsDataURL(b);},'image/jpeg',q);};im.onerror=rej;im.src=u;});}
