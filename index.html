@@ -66,6 +66,8 @@
     if (t) try { localStorage.setItem(CLAVE_TOKEN, t); } catch (e) {}
     return t || null;
   }
+  /* El enlace del puesto se guarda al abrir: hay pantallas que casi no consultan al arrancar. */
+  if (PROD && window.QR_PUESTO !== "vendedor" && /[#&]puesto=/.test(location.hash)) tokenPuesto();
   function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; return h; }
   function vigilarToken(status) { if (PROD && status === 401) { yaPregunto = false; try { localStorage.removeItem(CLAVE_TOKEN); } catch (e) {} } }
   var _fetch = window.fetch.bind(window);
