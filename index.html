@@ -1,6 +1,374 @@
 ﻿<!DOCTYPE html>
 <html lang="es">
 <head>
+<script>window.QR_PROD_API="https://queruclor-api.santamariapablodaniel.workers.dev";window.QR_API_BASE="https://queruclor-api.santamariapablodaniel.workers.dev";window.QR_PUESTO="reparto";window.QR_URL_REGISTRO="https://frosty-term-20ea.santamariapablodaniel.workers.dev/";window.QR_FOTOS_BASE="https://gjeyvbidomxzofcdycya.supabase.co/storage/v1/object/public/qr-fotos/";</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   CONEXIÓN AL SERVIDOR COMPARTIDO DE PRUEBAS — va PRIMERO en cada pantalla
+
+   Hace que las siete pantallas trabajen sobre LOS MISMOS datos (los del
+   servidor local, prototipo/servidor-compartido.js) sin tocar su código:
+
+   1. Lo que iba a Supabase (/rest/v1/…) va al servidor local, igual formato.
+   2. El pedido que iba al Worker va a /local/pedido (que guarda el pedido y
+      reserva el stock de Queruclor). Google Forms se contesta acá.
+      Cualquier otra escritura hacia afuera se frena: nada sale a producción.
+   3. El «tiempo real» de depósito y facturación se imita consultando los
+      cambios del servidor cada 1,5 s.
+   4. Unas pocas claves que tienen que verse entre pantallas (rendición de
+      habituales, sello de despacho, datos de la empresa, configuración de
+      precios…) se guardan en el servidor en vez de en el navegador.
+   5. QRSrv: llamadas a las funciones de la base para los módulos de
+      Queruclor (stock, cuentas, remitos…).
+
+   Si el servidor no responde, aparece arriba un aviso rojo y las
+   operaciones que no se pudieron guardar dan error (no se fingen hechas).
+
+   6. GENERACIÓN DEL ENTORNO (29/10/2026): cada escritura lleva la
+      generación que esta pantalla conoce (cabecera X-QR-Gen) y el servidor
+      rechaza la de otra. Al abrir, si el equipo guardaba colas de otra
+      generación (pedidos sin enviar, recibos, rendiciones, lecturas del
+      armado…), se APARTAN sin enviarlas ni borrarlas, con aviso. Recargar
+      no basta para limpiar una cola: por eso se aparta acá, explícito.
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  "use strict";
+  if (window.QR_LOCAL) return;
+  window.QR_LOCAL = true;
+  /* En producción (build-produccion.js) lo mismo va al Worker queruclor-api, con el token del puesto. */
+  var PROD = !!window.QR_PROD_API;
+  var ORIGEN = PROD ? window.QR_PROD_API : location.origin;
+  var CADA = PROD ? 10000 : 1500;
+  /* Una pestaña del contenedor Cartera/Pedidos sigue abierta en un iframe sin mostrarse, y
+     document.hidden no se entera: tampoco cuenta como visible. */
+  function oculta() {
+    if (document.hidden) return true;
+    try { var f = window.frameElement; return !!(f && f.getClientRects().length === 0); } catch (e) { return false; }
+  }
+  window.qrOculta = oculta;
+  if (PROD) window.qrFotoUrl = function (e) { return window.QR_FOTOS_BASE + e + ".jpg"; };
+  var CLAVE_TOKEN = window.QR_PUESTO === "admin" ? "qr_admin_token_v1" : "qr_token_puesto_v1";
+  var yaPregunto = false;
+  function tokenPuesto() {
+    if (!PROD || window.QR_PUESTO === "vendedor") return null;
+    var t = null; try { t = localStorage.getItem(CLAVE_TOKEN); } catch (e) {}
+    /* El enlace de instalación del puesto lo trae en #puesto=…: no viaja al servidor y se saca de la barra. */
+    var m = t ? null : /[#&]puesto=([^&]+)/.exec(location.hash);
+    if (m) {
+      t = decodeURIComponent(m[1]);
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    } else if (!t && !yaPregunto) {
+      /* Una sola vez por apertura: si se cancela, la app sigue andando con lo que no pide token. */
+      yaPregunto = true;
+      t = (window.prompt("Token de este puesto (" + window.QR_PUESTO + "). Se pide una sola vez en este equipo:") || "").trim();
+    }
+    if (t) try { localStorage.setItem(CLAVE_TOKEN, t); } catch (e) {}
+    return t || null;
+  }
+  function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; return h; }
+  function vigilarToken(status) { if (PROD && status === 401) { yaPregunto = false; try { localStorage.removeItem(CLAVE_TOKEN); } catch (e) {} } }
+  var _fetch = window.fetch.bind(window);
+  var GEN = null;
+
+  /* ── Aviso de conexión ─────────────────────────────────────────── */
+  var caido = false, aviso = null;
+  function pintarAviso() {
+    if (!document.body) return;
+    if (caido && !aviso) {
+      aviso = document.createElement("div");
+      aviso.id = "qrAvisoServidor";
+      aviso.setAttribute("role", "alert");
+      aviso.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:2147483647;background:#b91c1c;color:#fff;" +
+        "font:700 14px/1.35 system-ui,sans-serif;padding:10px 14px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.3)";
+      aviso.textContent = "⚠️ Sin conexión con el servidor. Lo que hagas ahora NO se guarda (los pedidos del vendedor quedan en su cola y salen solos al volver). Revisá que la ventana del servidor siga abierta.";
+      document.body.appendChild(aviso);
+    } else if (!caido && aviso) { aviso.remove(); aviso = null; }
+  }
+  function marcar(estado) { if (caido !== estado) { caido = estado; pintarAviso(); } }
+  function ping() {
+    /* En producción: oculta no consulta, y si la pantalla ya pregunta por cambios, eso mismo dice si hay conexión. */
+    if (PROD && (oculta() || (oyentesCambios && oyentesCambios.length))) return;
+    _fetch(ORIGEN + "/local/salud", { cache: "no-store" }).then(function (r) {
+      marcar(!r.ok);
+      return r.ok ? r.json().then(function (j) {
+        if (j && j.generacion && GEN && j.generacion !== GEN) avisoGeneracion();
+        else if (j && j.generacion && !GEN) revisarGeneracion(j.generacion);
+      }) : null;
+    }).catch(function () { marcar(true); });
+  }
+  setInterval(ping, PROD ? 30000 : 4000);
+  document.addEventListener("DOMContentLoaded", function () { pintarAviso(); ping(); });
+
+  /* ── Llamadas síncronas al servidor (módulos de Queruclor) ────────
+     Los módulos de Queruclor tienen una interfaz síncrona (Stock.disponible,
+     Cuentas.saldo…). Con el servidor en la misma PC o el mismo Wi-Fi la
+     respuesta tarda milisegundos, así que se llama de forma síncrona y las
+     pantallas no cambian. */
+  function xhr(metodo, url, cuerpo) {
+    var x = new XMLHttpRequest();
+    try {
+      x.open(metodo, ORIGEN + url, false);
+      x.setRequestHeader("Content-Type", "application/json");
+      if (GEN) x.setRequestHeader("X-QR-Gen", GEN);
+      var h0 = conToken({}); for (var k0 in h0) x.setRequestHeader(k0, h0[k0]);
+      x.send(cuerpo === undefined ? null : JSON.stringify(cuerpo));
+    } catch (e) {
+      marcar(true);
+      throw new Error("Sin conexión con el servidor: no se guardó.");
+    }
+    vigilarToken(x.status);
+    if (x.status === 0 || x.status >= 500) { marcar(true); throw new Error("El servidor no respondió (" + x.status + "): no se guardó."); }
+    marcar(false);
+    var datos = null;
+    try { datos = x.responseText ? JSON.parse(x.responseText) : null; } catch (e) {}
+    if (x.status === 409 && datos && datos.generacion_vieja) avisoGeneracion();
+    if (x.status >= 400) throw new Error((datos && (datos.message || datos.error)) || ("error " + x.status));
+    return datos;
+  }
+  var cache = {};
+  window.QRSrv = {
+    rpc: function (fn, args) { var r = xhr("POST", "/rest/v1/rpc/" + fn, args || {}); cache = {}; return r; },
+    /* Lecturas con memoria corta: una pantalla pregunta el stock de cada
+       tarjeta varias veces por dibujo; con esto es una sola consulta. */
+    get: function (tabla, qs, ttl) {
+      var k = tabla + "?" + (qs || ""), ahora = Date.now();
+      if (cache[k] && ahora - cache[k].t < (ttl == null ? 1500 : ttl)) return cache[k].v;
+      var v = xhr("GET", "/rest/v1/" + tabla + (qs ? "?" + qs : ""));
+      cache[k] = { t: ahora, v: v };
+      return v;
+    },
+    olvidar: function () { cache = {}; },
+    generacion: function () { return GEN; },
+    caido: function () { return caido; },
+    /* Aviso de cambios para las pantallas que no usan el cliente de
+       Supabase (admin, vendedor). En producción es un canal de Realtime;
+       acá lee el mismo registro que reparte el «tiempo real» local, y
+       solo con la pestaña a la vista. fn(tablasQueCambiaron). */
+    escuchar: function (tablas, fn) { oyentesCambios.push({ tablas: tablas, fn: fn }); arrancarCambios(); },
+  };
+  var oyentesCambios = [], desdeCambios = -1, timerCambios = null;
+  function arrancarCambios() {
+    if (timerCambios) return;
+    timerCambios = setTimeout(function tick() {
+      if (oculta()) { timerCambios = setTimeout(tick, CADA); return; }
+      _fetch(ORIGEN + "/local/cambios?desde=" + desdeCambios, { cache: "no-store", headers: conToken({}) }).then(function (r) { return r.json(); }).then(function (j) {
+        marcar(false);
+        if (desdeCambios >= 0 && j.cambios && j.cambios.length) {
+          var hubo = {};
+          j.cambios.forEach(function (c) { hubo[c.tabla] = true; });
+          cache = {};
+          oyentesCambios.forEach(function (o) {
+            var t = o.tablas.filter(function (x) { return hubo[x]; });
+            if (t.length) try { o.fn(t); } catch (e) { console.warn("[cambios]", e); }
+          });
+        }
+        desdeCambios = j.ultimo;
+      }).catch(function () { marcar(true); }).then(function () { timerCambios = setTimeout(tick, CADA); });
+    }, 50);
+  }
+
+  /* ── Claves compartidas entre pantallas ─────────────────────────── */
+  var COMPARTIDAS = /^(qr_rend_ml_v1|qr_despacho_v1|qr_empresa_v1|qr_logo_v1|qr_papelera_v1|qr_pin_ajustes_v1|qr_precio_config_v1|qr_margen_rubros_v1|qr_historial_precios_v1|qr_compras_cfg_v1|qr_demanda_v1|qr_demanda_rubros_v1|qr_demanda_crit_v1|qr_etq_impresas_v1|etiquetas_total_impresa_v1|etiquetas_habituales_v1|etiquetas_cabos_v1)$/;
+  var S = Storage.prototype, g0 = S.getItem, s0 = S.setItem, r0 = S.removeItem;
+  var kvCache = {};
+  S.getItem = function (k) {
+    if (this !== window.localStorage || !COMPARTIDAS.test(k)) return g0.call(this, k);
+    var c = kvCache[k];
+    if (c && Date.now() - c.t < 800) return c.v;
+    try { var v = xhr("GET", "/local/kv/" + k).valor; kvCache[k] = { t: Date.now(), v: v }; return v; }
+    catch (e) { return c ? c.v : null; }
+  };
+  S.setItem = function (k, v) {
+    if (this !== window.localStorage || !COMPARTIDAS.test(k)) return s0.call(this, k, v);
+    var x = new XMLHttpRequest();
+    x.open("PUT", ORIGEN + "/local/kv/" + k, false);
+    if (GEN) x.setRequestHeader("X-QR-Gen", GEN);
+    var hk = conToken({}); for (var kk in hk) x.setRequestHeader(kk, hk[kk]);
+    try { x.send(String(v)); } catch (e) { marcar(true); throw new Error("Sin conexión con el servidor: no se guardó."); }
+    if (x.status === 409) { avisoGeneracion(); throw new Error("Esta pantalla es de antes de renovar el entorno: no se guardó. Recargala."); }
+    if (x.status !== 200) { marcar(true); throw new Error("El servidor no guardó " + k); }
+    kvCache[k] = { t: Date.now(), v: String(v) };
+  };
+  S.removeItem = function (k) {
+    if (this !== window.localStorage || !COMPARTIDAS.test(k)) return r0.call(this, k);
+    xhr("DELETE", "/local/kv/" + k); delete kvCache[k];
+  };
+
+  /* ── fetch: Supabase, Worker y Forms van al servidor local ──────── */
+  function esPedido(cuerpo) { return cuerpo && (cuerpo.fechaEntrega || cuerpo.numeroCliente) && cuerpo.productos !== undefined; }
+  window.fetch = function (input, opts) {
+    var url = String((input && input.url) || input || "");
+    var metodo = String((opts && opts.method) || (input && input.method) || "GET").toUpperCase();
+    if (PROD) {
+      /* Lo de Queruclor va al Worker con el token del puesto; un pedido con Queruclor también.
+         Lo demás (Supabase de las apps actuales, Forms, otros Workers) sigue yendo adonde iba. */
+      var propio = /^\/(local|api|rest)\//.test(url) ? ORIGEN + url : (url.indexOf(ORIGEN) === 0 ? url : null);
+      if (propio) {
+        var o = Object.assign({}, opts || {}), hs = {};
+        if (o.headers && typeof o.headers.forEach === "function") o.headers.forEach(function (v, k) { hs[k] = v; }); else Object.assign(hs, o.headers || {});
+        o.headers = conToken(hs);
+        return _fetch(propio, o).then(function (r) { vigilarToken(r.status); marcar(r.status >= 500); return r; }, function (e) { marcar(true); throw e; });
+      }
+      if (/frosty-term/.test(url) && metodo === "POST") {
+        var cp = null; try { cp = JSON.parse((opts && opts.body) || "null"); } catch (e) {}
+        if (esPedido(cp) && /—\s*QUERUCLOR/iu.test(String(cp.productos))) return enviarPedido(opts);
+      }
+      return _fetch(input, opts);
+    }
+    var m = /^https:\/\/[a-z0-9]+\.supabase\.co(\/rest\/v1\/.*)$/.exec(url);
+    if (m) return _fetch(ORIGEN + m[1], conGen(opts)).then(function (r) { marcar(false); vigilar(r); return r; }, function (e) { marcar(true); throw e; });
+
+    if (/workers\.dev/.test(url) && metodo === "POST") {
+      var cuerpo = null; try { cuerpo = JSON.parse((opts && opts.body) || "null"); } catch (e) {}
+      if (esPedido(cuerpo)) return enviarPedido(opts);
+      return Promise.resolve(new Response('{"status":"ok","prueba":true}', { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (/docs\.google\.com\/forms/.test(url)) return _fetch(ORIGEN + "/local/forms", conGen({ method: "POST", body: "{}" })).catch(function (e) { marcar(true); throw e; });
+
+    /* Nada más sale hacia afuera escribiendo: ni Apps Script, ni otros Workers. */
+    if (metodo !== "GET" && metodo !== "HEAD" && /^https?:\/\//.test(url) && url.indexOf(ORIGEN) !== 0) {
+      return Promise.resolve(new Response('{"status":"ok","success":true,"ok":true,"prueba":true}', { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    /* Lo que va al mismo servidor también lleva la generación. */
+    if (metodo !== "GET" && metodo !== "HEAD" && (url.indexOf(ORIGEN) === 0 || /^\/(?!\/)/.test(url))) {
+      if (input && typeof input !== "string" && input.headers && GEN) { try { input.headers.set("X-QR-Gen", GEN); } catch (e) {} }
+      return _fetch(input, conGen(opts)).then(function (r) { vigilar(r); return r; });
+    }
+    return _fetch(input, opts);
+  };
+  function enviarPedido(opts) {
+    return _fetch(ORIGEN + "/local/pedido", conGen({ method: "POST", headers: { "Content-Type": "application/json" }, body: opts.body }))
+      .then(function (r) {
+        marcar(false);
+        return r.clone().json().then(function (j) {
+          /* El stock se reservó al LLEGAR el pedido. Si faltó algo, se le
+             avisa al vendedor como antes. */
+          if (j && j.reserva && j.reserva.faltantes && j.reserva.faltantes.length && window.qrAvisarFaltantes) {
+            try { window.qrAvisarFaltantes(j.reserva); } catch (e) {}
+          }
+          /* Un artículo pausado que llegó igual (pedido cargado antes de
+             la pausa, guardado sin señal) no se vende: queda como faltante. */
+          var pz = j && j.validacion && j.validacion.pausados;
+          if (pz && pz.length && window.showToast) {
+            try { window.showToast("No se vendió (artículo pausado): " + pz.map(function (x) { return x.nombre || x.ean; }).join(", "), "error"); } catch (e) {}
+          }
+          return r;
+        }, function () { return r; });
+      }, function (e) { marcar(true); throw e; });
+  }
+  function conGen(opts) {
+    if (!GEN) return opts;
+    var o = Object.assign({}, opts || {});
+    var h = o.headers;
+    if (h && typeof h.set === "function") { h = new Headers(h); h.set("X-QR-Gen", GEN); }
+    else h = Object.assign({}, h || {}, { "X-QR-Gen": GEN });
+    o.headers = h;
+    return o;
+  }
+  function vigilar(r) { try { if (r && r.status === 409 && r.headers.get("X-QR-Generacion-Vieja")) avisoGeneracion(); } catch (e) {} }
+
+  /* ── Generación del entorno y colas viejas ───────────────────────── */
+  var GEN_KEY = "qr_entorno_gen_v1";
+  var COLAS = ["pedidosPendientes", "qr_recibos_pendientes_v1", "qr_reparto_cola_v1", "qr_rend_pendiente_v1", "rendicion_pending", "qr_prep_cola_v1"];
+  var vacia = function (v) { return v == null || v === "" || v === "[]" || v === "{}" || v === "null"; };
+  var avisoGen = null, avisoApartadas = null;
+  function avisoGeneracion() {
+    if (avisoGen || !document.body) return;
+    avisoGen = document.createElement("div");
+    avisoGen.id = "qrAvisoGeneracion"; avisoGen.setAttribute("role", "alert");
+    avisoGen.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:2147483647;background:#7c2d12;color:#fff;font:700 14px/1.35 system-ui,sans-serif;padding:10px 14px;text-align:center";
+    avisoGen.innerHTML = "⚠️ Esta pantalla es de antes de que se renovara el entorno de prueba: lo que hagas no se guarda. " +
+      "<button type=\"button\" style=\"margin-left:8px;font:inherit;padding:4px 10px;border-radius:8px;border:0;cursor:pointer\" onclick=\"location.reload()\">Recargar</button>";
+    document.body.appendChild(avisoGen);
+  }
+  function revisarGeneracion(gen) {
+    var ls = window.localStorage, antes = null, apartadas = [];
+    try { antes = g0.call(ls, GEN_KEY); } catch (e) { return; }
+    if (antes !== gen) {
+      COLAS.forEach(function (k) {
+        var v = null; try { v = g0.call(ls, k); } catch (e) {}
+        if (vacia(v)) return;
+        try { s0.call(ls, "qr_apartado|" + (antes || "sin-generacion") + "|" + k, JSON.stringify({ valor: v, apartado: new Date().toISOString(), generacion_nueva: gen })); r0.call(ls, k); apartadas.push(k); } catch (e) {}
+      });
+      try { s0.call(ls, GEN_KEY, gen); } catch (e) {}
+    }
+    GEN = gen;
+    if (apartadas.length) {
+      window.QR_APARTADAS = apartadas;
+      var pintar = function () {
+        if (avisoApartadas || !document.body) return;
+        avisoApartadas = document.createElement("div");
+        avisoApartadas.id = "qrAvisoApartadas"; avisoApartadas.setAttribute("role", "status");
+        avisoApartadas.style.cssText = "position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483646;background:#fef3c7;color:#78350f;border:2px solid #f59e0b;border-radius:12px;font:600 13.5px/1.4 system-ui,sans-serif;padding:10px 14px";
+        avisoApartadas.innerHTML = "Este equipo tenía operaciones guardadas sin enviar de antes de renovar el entorno (" + apartadas.length + "). <b>No se enviaron</b>: quedaron apartadas en el equipo. " +
+          "<button type=\"button\" style=\"margin-left:6px;font:inherit;padding:3px 10px;border-radius:8px;border:1px solid #b45309;background:#fff;cursor:pointer\" onclick=\"this.parentNode.remove()\">Entendido</button>";
+        document.body.appendChild(avisoApartadas);
+      };
+      if (document.body) pintar(); else document.addEventListener("DOMContentLoaded", pintar);
+    }
+  }
+
+  /* ── Sin service workers en el sistema de prueba ──────────────────
+     Guardarían copias de las páginas y, al rearmarlas, se seguiría viendo
+     la versión vieja. Se contesta un registro de mentira para que las
+     pantallas que lo esperan no fallen. */
+  if (navigator.serviceWorker && !PROD) {
+    try {
+      var regFalso = { scope: location.href, installing: null, waiting: null, active: null,
+        update: function () { return Promise.resolve(); }, unregister: function () { return Promise.resolve(true); },
+        addEventListener: function () {}, removeEventListener: function () {} };
+      navigator.serviceWorker.register = function () { return Promise.resolve(regFalso); };
+      if (navigator.serviceWorker.getRegistrations) navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.unregister(); }); });
+    } catch (e) {}
+  }
+
+  /* ── Tiempo real de Supabase, imitado ───────────────────────────── */
+  var WS0 = window.WebSocket;
+  function RealtimeLocal(url) {
+    var ws = this, desde = -1, timer = null, cerrado = false;
+    ws.url = url; ws.readyState = 0; ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    var oyentes = { open: [], message: [], close: [], error: [] };
+    ws.addEventListener = function (t, f) { (oyentes[t] = oyentes[t] || []).push(f); };
+    ws.removeEventListener = function (t, f) { oyentes[t] = (oyentes[t] || []).filter(function (x) { return x !== f; }); };
+    function emitir(t, ev) { if (typeof ws["on" + t] === "function") ws["on" + t](ev); (oyentes[t] || []).forEach(function (f) { f(ev); }); }
+    ws.send = function () {};
+    ws.close = function () { cerrado = true; clearTimeout(timer); ws.readyState = 3; };
+    function tick() {
+      if (cerrado) return;
+      _fetch(ORIGEN + "/local/cambios?desde=" + desde, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+        if (desde >= 0) (j.cambios || []).forEach(function (c) {
+          emitir("message", { data: JSON.stringify({ topic: "realtime:public:" + c.tabla, event: "postgres_changes",
+            payload: { data: { table: c.tabla, type: c.tipo, record: c.fila, old_record: c.fila, schema: "public" } } }) });
+        });
+        desde = j.ultimo;
+      }).catch(function () {}).then(function () { timer = setTimeout(tick, 1500); });
+    }
+    setTimeout(function () { ws.readyState = 1; emitir("open", {}); tick(); }, 30);
+  }
+  if (!PROD) {
+    window.WebSocket = function (url, p) {
+      if (/supabase\.co/.test(String(url))) return new RealtimeLocal(url);
+      return p === undefined ? new WS0(url) : new WS0(url, p);
+    };
+    window.WebSocket.prototype = WS0.prototype;
+    ["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach(function (k, i) { window.WebSocket[k] = i; });
+  }
+
+  /* Generación: se pregunta al abrir (al final de este archivo, que va
+     PRIMERO en la página), ANTES de que cualquier cola intente salir. */
+  (function () {
+    if (PROD) return;
+    try {
+      var x = new XMLHttpRequest();
+      x.open("GET", ORIGEN + "/local/salud", false); x.send(null);
+      var j = x.status === 200 ? JSON.parse(x.responseText) : null;
+      if (j && j.generacion) revisarGeneracion(j.generacion);
+    } catch (e) {}
+  })();
+})();
+
+</script>
+
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
 <meta name="theme-color" content="#ffffff"/>
@@ -1336,5 +1704,1297 @@ checkRendicionPendiente(); // red de seguridad: avisa si quedó una rendición s
 uSyncBadge(); // refleja de entrada si quedó algo pendiente de una sesión anterior
 if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(_=>{});
 window.openModal=openModal;window.uOrd=uOrd;
+</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   CUENTAS CORRIENTES Y COMISIONES — versión CONECTADA (misma interfaz que
+   cuentas.js y comisiones.js). Las reglas viven en la base
+   (002_queruclor_cuentas.sql), probadas al centavo contra los originales:
+   el talonario y la imputación son atómicos aunque cobren dos PCs a la vez.
+   ═══════════════════════════════════════════════════════════════════ */
+(function (global) {
+  if (!global.QRSrv) return;
+  const S = global.QRSrv;
+  const dinero = n => Math.round((Number(n) || 0) * 100) / 100;
+  const q = v => encodeURIComponent(String(v));
+
+  /* ── Cuentas ─────────────────────────────────────────────────────── */
+  const movimientos = clienteId => S.get("qr_cuenta_movs", (clienteId == null ? "" : "cliente_id=eq." + q(clienteId) + "&") + "order=seq.asc");
+  const abrir = comp => S.rpc("qr_abrir_cuenta", { c: comp });
+  const notaCredito = o => S.rpc("qr_nota_credito", { o });
+  const recibo = o => S.rpc("qr_recibo", { o });
+  const recibos = clienteId => S.get("qr_recibos", (clienteId == null ? "" : "cliente_id=eq." + q(clienteId) + "&") + "order=seq.asc");
+  const pendientes = clienteId => S.rpc("qr_pendientes", { p_cliente: clienteId == null ? null : String(clienteId) }) || [];
+  const saldo = clienteId => S.rpc("qr_saldo", { p_cliente: String(clienteId) });
+  const saldoAnterior = (clienteId, comprobante) => S.rpc("qr_saldo_anterior", { p_cliente: String(clienteId), p_comprobante: comprobante || null });
+  function vencidos(clienteId, dias) {
+    const limite = new Date(Date.now() - (dias || 30) * 864e5).toISOString();
+    return pendientes(clienteId).filter(x => x.fecha < limite);
+  }
+  function buscar(texto) {
+    const t = String(texto || "").trim().toLowerCase();
+    if (!t) return [];
+    const porCliente = new Map();
+    for (const a of movimientos()) if (!porCliente.has(a.cliente_id)) porCliente.set(a.cliente_id, { id: a.cliente_id, nombre: a.cliente_nombre });
+    return [...porCliente.values()]
+      .filter(c => String(c.id).startsWith(t) || String(c.nombre).toLowerCase().includes(t))
+      .map(c => Object.assign({}, c, { saldo: saldo(c.id), vencidos: vencidos(c.id).length }));
+  }
+  const anular = (tipo, id) => S.rpc("qr_anular", { p_tipo: tipo, p_id: id });
+  const restaurar = (tipo, objeto) => S.rpc("qr_restaurar", { p_tipo: tipo, o: objeto });
+
+  global.Cuentas = {
+    abrir, notaCredito, recibo, recibos, anular, restaurar,
+    saldo, saldoAnterior, pendientes, vencidos, movimientos, buscar,
+    _reset: () => { throw new Error("En el sistema compartido las cuentas no se borran desde una pantalla."); },
+    _remoto: true,
+  };
+
+  /* ── Comisiones ──────────────────────────────────────────────────── */
+  const PCT_DEFECTO = 1, SIN_COMISION = ["MERCADO LIMPIO"];
+  const cobraComision = v => !!v && !SIN_COMISION.includes(String(v).toUpperCase());
+  function pctDe(vendedor) {
+    const r = (S.get("qr_comision_cfg", "select=vendedor,pct") || []).find(x => x.vendedor === vendedor);
+    return r ? Number(r.pct) : PCT_DEFECTO;
+  }
+  const setPct = (vendedor, pct) => S.rpc("qr_set_pct", { p_vendedor: vendedor, p_pct: Number(pct) });
+  const ciclos = () => S.get("qr_ciclos", "order=seq.asc");
+  const cerrados = () => ciclos().filter(c => c.estado === "cerrado");
+  const abierto = () => S.rpc("qr_comisiones_abierto", {});
+  const abiertoDe = nombre => S.rpc("qr_comision_abierta_de", { p_nombre: nombre || "" });
+  const cerrar = quien => S.rpc("qr_cerrar_comisiones", { p_quien: quien || "" });
+  const cerrarVendedor = (nombre, quien, extra) => S.rpc("qr_cerrar_comision_vendedor", { p_nombre: nombre, p_quien: quien || "", p_extra: extra || {} });
+  const reabrir = idCiclo => S.rpc("qr_reabrir_ciclo", { p_id: idCiclo });
+  function ultimoCiclo(nombre) {
+    const n = String(nombre || "").toUpperCase();
+    const mios = ciclos().filter(c => String(c.vendedor || "").toUpperCase() === n);
+    return mios.length ? mios[mios.length - 1] : null;
+  }
+  const sinCobroRegistrado = () => S.get("qr_remitos_sin_cobro", "select=*") || [];
+  /* 16/10/2026: comisión sobre el importe cobrado; cerrar y pagar son dos
+     operaciones. La base guarda el detalle de cada liquidación. */
+  const cerrarSemana = (vendedor, op, quien, baja) => S.rpc("qr_comision_cerrar", { p: { vendedor, op, quien: quien || "", baja: baja || null } });
+  const liquidaciones = vendedor => S.rpc("qr_liquidaciones", { o: vendedor ? { vendedor } : {} }) || [];
+  const pagarLiquidacion = (id, op, forma, quien) => S.rpc("qr_liquidacion_pagar", { p: { liquidacion: id, op, forma: forma || "", quien: quien || "" } });
+
+  global.Comisiones = {
+    PCT_DEFECTO, SIN_COMISION, cobraComision, pctDe, setPct,
+    abierto, cerrar, ciclos, cerrados, sinCobroRegistrado,
+    abiertoDe, cerrarVendedor, reabrir, ultimoCiclo,
+    cerrarSemana, liquidaciones, pagarLiquidacion,
+    _reset: () => { throw new Error("En el sistema compartido las comisiones no se borran desde una pantalla."); },
+    _remoto: true,
+  };
+  void dinero;
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   REPARTO Y BLOQUES DE ARMADO — versión CONECTADA (misma interfaz que
+   reparto-store.js y deposito-bloques.js). Las reglas viven en la base
+   (003_queruclor_documentos.sql), probadas contra los originales.
+   ═══════════════════════════════════════════════════════════════════ */
+(function (global) {
+  if (!global.QRSrv) return;
+  const S = global.QRSrv;
+  const dinero = n => Math.round((Number(n) || 0) * 100) / 100;
+
+  /* ── Reparto (línea QUERUCLOR del repartidor) ───────────────────── */
+  const entregas = f => { const e = S.get("qr_entregas", "order=seq.asc") || []; return f ? e.filter(f) : e; };
+  global.Reparto = {
+    cargar: (comp, bultos) => S.rpc("qr_cargar_entrega", { c: comp, p_bultos: bultos || 0 }),
+    pendientes: () => entregas(e => e.estado === "pendiente"),
+    entregas,
+    registrar: o => S.rpc("qr_registrar_entrega", { o }),
+    rendir: o => S.rpc("qr_rendir", { o: o || {} }),
+    rendiciones: () => S.get("qr_rendiciones", "order=seq.asc") || [],
+    deRendicion: id => entregas(e => e.rendicion === id),
+    /* Lo que hay que cobrar en la puerta: el saldo real del remito (con las
+       notas de crédito ya emitidas) menos lo rechazado que todavía no tiene
+       nota, más lo que debía de antes. Lo calcula la base: así un rechazo no
+       se descuenta dos veces cuando después se emite su nota. */
+    aPagar: ent => {
+      if (ent.estado !== "pendiente" && ent.cobrado != null) return dinero(ent.cobrado);
+      try { const r = S.rpc("qr_a_cobrar_entrega", { p_remito: ent.remito }); if (r && r.a_cobrar != null) return dinero(r.a_cobrar); } catch (e) {}
+      return dinero(ent.total + ent.saldo_anterior);
+    },
+    detalleCobro: ent => { try { return S.rpc("qr_a_cobrar_entrega", { p_remito: ent.remito }); } catch (e) { return null; } },
+    _reset: () => { throw new Error("En el sistema compartido el reparto no se borra desde una pantalla."); },
+    _remoto: true,
+  };
+
+  /* ── Bloques de armado (dos personas en el mismo pedido) ────────── */
+  const DEF = {
+    queruclor:  { nombre: "QUERUCLOR",           icono: "🧴", nota: "Cajas cerradas — van directo a despacho" },
+    habituales: { nombre: "ARTÍCULOS HABITUALES", icono: "🧺", nota: "Sueltos y livianos — al canasto y a la mesa" },
+  };
+  function bloqueDe(item) {
+    if (!global.QRParse) return "habituales";
+    return QRParse.parseQueruclor(item.descripcion) ? "queruclor" : "habituales";
+  }
+  function bloques(items) {
+    const hay = new Set((items || []).map(bloqueDe));
+    return ["habituales", "queruclor"].filter(b => hay.has(b));
+  }
+  function estado(pedidoId, bloque) {
+    const k = "p" + pedidoId + "|" + bloque;
+    const b = (S.get("qr_bloques", "select=*", 1000) || []).find(x => x.clave === k);
+    return b || { tomado_por: null, tomado_at: null, listo: false, listo_at: null };
+  }
+  function puede(pedidoId, item, quien) {
+    const bl = bloqueDe(item), e = estado(pedidoId, bl);
+    if (!e.tomado_por) return { ok: true, libre: true, bloque: bl };
+    if (e.tomado_por === quien) return { ok: true, libre: false, bloque: bl };
+    return { ok: false, por: e.tomado_por, bloque: bl };
+  }
+  function todosListos(pedidoId, items) {
+    const bs = bloques(items);
+    if (bs.length < 2) return false;
+    return bs.every(b => estado(pedidoId, b).listo);
+  }
+  function resumen(pedidoId, items) {
+    return bloques(items).map(b => {
+      const e = estado(pedidoId, b), propios = items.filter(i => bloqueDe(i) === b);
+      return Object.assign({ bloque: b }, DEF[b], e, { total: propios.length, armados: propios.filter(i => i.armado).length });
+    });
+  }
+  global.Bloques = {
+    DEF, bloqueDe, bloques, estado,
+    tomar: (pedidoId, bloque, quien) => S.rpc("qr_tomar_bloque", { p_pedido: String(pedidoId), p_bloque: bloque, p_quien: quien }),
+    soltar: (pedidoId, bloque) => { S.rpc("qr_soltar_bloque", { p_pedido: String(pedidoId), p_bloque: bloque }); },
+    /* 18/10/2026: reasignar con motivo (queda en el historial del bloque). */
+    reasignar: (pedidoId, bloque, quien, motivo) => S.rpc("qr_bloque_reasignar", { p: { pedido: String(pedidoId), bloque, quien, motivo } }),
+    marcarListo: (pedidoId, bloque, quien) => S.rpc("qr_bloque_listo", { p_pedido: String(pedidoId), p_bloque: bloque, p_quien: quien }),
+    puede, todosListos, resumen,
+    sinTomar: horas => (S.rpc("qr_bloques_sin_tomar", { p_horas: horas || 2 }) || []),
+    _reset: () => { throw new Error("En el sistema compartido los bloques no se borran desde una pantalla."); },
+    _remoto: true,
+  };
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   QUERUCLOR DENTRO DE LA APP DE NICO
+
+   La app real es la PWA de GestionRepartoML. Queruclor se injerta ahí sin
+   tocarle una línea: Nico no abre dos aplicaciones, es la misma visita y
+   el mismo timbre. Las dos entregas del cliente se ven con la misma
+   jerarquía (Habituales y Queruclor), cada una con su distintivo de texto,
+   y al terminar una se abre la otra (Nico está frente al mostrador).
+   No se suman los totales: Habituales factura por E-Pyme y Queruclor por
+   el sistema nuevo.
+
+   18/10/2026 — la hoja de Queruclor separa dos preguntas:
+     1. ¿Qué pasó con la entrega?  Entregó todo · Entregó una parte ·
+        Rechazó todo · No se pudo entregar (Local cerrado / No llegué).
+     2. ¿Cobró?                      Efectivo · Transferencia · Cheque ·
+        No pagó — nada preseleccionado; «Pagó todo» o el importe real.
+   «No pagó» es del cobro, no es un rechazo. Registrar un rechazo no emite
+   la nota ni confirma que la mercadería llegó al depósito. Una visita sin
+   entrega no genera cobro, recibo, nota ni movimiento de stock: la entrega
+   queda pendiente de reprogramar.
+   Sin conexión, lo registrado queda en una cola del teléfono (con la misma
+   identidad de operación) y se reintenta: no se muestra como hecho hasta
+   que la base lo confirma, y reintentar no duplica.
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+
+  const esc = s => String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const mn = n => (Math.round((Number(n) || 0) * 100) / 100)
+    .toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pesos = n => "$" + mn(n);
+  const dinero = n => Math.round((Number(n) || 0) * 100) / 100;
+
+  let cacheEnt = null, cacheEn = 0;
+  const todas = () => {
+    if (!window.Reparto) return [];
+    if (cacheEnt && Date.now() - cacheEn < 800) return cacheEnt;
+    try { cacheEnt = Reparto.entregas(); cacheEn = Date.now(); } catch (e) { cacheEnt = cacheEnt || []; }
+    return cacheEnt;
+  };
+  const invalidar = () => { cacheEnt = null; };
+  const soloNums = s => String(s || "").replace(/[^\d]/g, "");
+  const enLinea = () => !!(window.QR_LOCAL && window.QRSrv);
+
+  /* `const S` de la app no cuelga de window: se lee por alcance léxico. */
+  const app = () => (typeof S !== "undefined" && S ? S : null);
+  const quienRep = () => ((app() && app().rep) || "");
+
+  /* El vínculo entre las dos listas es el NÚMERO DE CLIENTE. */
+  /* 20/10/2026: el teléfono toma los remitos que se PROGRAMARON (vinculados en
+     la fila por su pedido y remito), no todos los pendientes del cliente. Si
+     un cliente tiene dos pedidos y la oficina eligió uno, el otro sigue
+     pendiente. La lista de demostración (?demo=1) no trae vínculos: ahí se
+     mantiene la búsqueda por cliente. */
+  function vinculados() {
+    const s = app(); const set = new Set();
+    ((s && s.peds) || []).forEach(p => {
+      (Array.isArray(p.remitos) ? p.remitos : []).forEach(r => { if (r && r.remito) set.add(String(r.remito)); });
+      if (p.remito && !Array.isArray(p.remitos)) String(p.remito).split(" + ").forEach(r => set.add(r.trim()));
+    });
+    return set;
+  }
+  const porCliente = () => !!window.__PROTO_DEMO;
+  function entregaDe(num) {
+    const n = soloNums(num);
+    if (!n) return null;
+    const l = delRecorrido().filter(e => soloNums(e.cliente_id) === n);
+    return l.find(e => e.estado === "pendiente") || l[l.length - 1] || null;
+  }
+  function indiceDe(num) {
+    const s = app();
+    if (!s || !Array.isArray(s.peds)) return -1;
+    const n = soloNums(num);
+    return s.peds.findIndex(p => soloNums(p.numeroCliente) === n);
+  }
+  function pedidoDe(num) { const s = app(); const i = indiceDe(num); return (s && i >= 0) ? s.peds[i] : null; }
+
+  /* ── Cola del teléfono (sin conexión) ─────────────────────────── */
+  const K_COLA = "qr_reparto_cola_v1";
+  const leerCola = () => { try { return JSON.parse(localStorage.getItem(K_COLA) || "[]"); } catch (e) { return []; } };
+  const guardarCola = l => { try { localStorage.setItem(K_COLA, JSON.stringify(l)); } catch (e) {} };
+  let errorSync = "";
+  /* Ejecuta una operación en la base. Si no hay conexión, queda en la cola
+     (misma identidad) y devuelve {encolada:true}. Si la base responde con
+     un rechazo de negocio, se devuelve tal cual (no se encola). */
+  function ejecutar(op) {
+    try {
+      const r = correr(op);
+      invalidar();
+      return r;
+    } catch (e) {
+      const l = leerCola();
+      if (!l.some(x => x.id === op.id)) { l.push(Object.assign({ creado: new Date().toISOString() }, op)); guardarCola(l); }
+      return { encolada: true, motivo: e.message };
+    }
+  }
+  function correr(op) {
+    if (op.tipo === "registrar") { const r = Reparto.registrar(op.payload); if (!r) throw new Error("sin respuesta"); return { ok: true, r }; }
+    if (op.tipo === "visita") return QRSrv.rpc("qr_visita_registrar", { o: op.payload });
+    if (op.tipo === "dev") return QRSrv.rpc("qr_dev_operar", { o: op.payload });
+    throw new Error("operación desconocida");
+  }
+  /* Reintenta en orden. Una operación que la base rechaza (no por falta de
+     conexión) sale de la cola y queda el aviso para revisarla. */
+  function sincronizar() {
+    const l = leerCola();
+    if (!l.length || !enLinea()) return { pendientes: l.length };
+    const quedan = [];
+    for (let i = 0; i < l.length; i++) {
+      let r;
+      try { r = correr(l[i]); }
+      catch (e) { quedan.push(...l.slice(i)); break; }
+      if (r && r.ok === false) errorSync = (l[i].cliente || "") + ": " + (r.motivo || "la base no lo aceptó");
+    }
+    guardarCola(quedan); invalidar();
+    if (!quedan.length && l.length && window.toast) toast("📤 Queruclor sincronizado");
+    try { refrescar(); } catch (e) {}
+    return { pendientes: quedan.length };
+  }
+  setInterval(() => { if (navigator.onLine && leerCola().length) sincronizar(); }, 15000);
+  window.addEventListener("online", () => setTimeout(sincronizar, 500));
+  const enCola = entId => leerCola().filter(x => x.ent === entId);
+
+  /* ── El recorrido (fecha + turno + repartidor) ────────────────── */
+  const hoyLocal = () => { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); };
+  function recorridoId() { const s = app(); return s && s.turno && s.rep ? hoyLocal() + "|" + s.turno + "|" + String(s.rep).toUpperCase() : null; }
+  let _asignados = "";
+  function asignarRecorrido() {
+    if (!enLinea()) return;
+    const s = app(); if (!s || !s.turno || !s.rep || !Array.isArray(s.peds)) return;
+    const clientes = new Set(s.peds.map(p => soloNums(p.numeroCliente))), vin = vinculados();
+    const rems = todas().filter(e => e.estado === "pendiente" && (vin.has(String(e.remito)) || (porCliente() && clientes.has(soloNums(e.cliente_id))))).map(e => e.remito).sort();
+    const firma = recorridoId() + ":" + rems.join(",");
+    if (!rems.length || firma === _asignados) return;
+    try { const r = QRSrv.rpc("qr_recorrido_asignar", { o: { fecha: hoyLocal(), turno: s.turno, repartidor: s.rep, remitos: rems } }); if (r && r.ok) { _asignados = firma; invalidar(); } }
+    catch (e) { /* sin señal: se reintenta en el próximo refresco */ }
+  }
+
+  /* Estado de un documento de Queruclor para el recorrido de hoy. */
+  function estadoDoc(ent) {
+    if (!ent) return "pendiente";
+    if (enCola(ent.id).length) return "cola";
+    if (ent.estado !== "pendiente") return "resuelto";
+    const v = ent.ultima_visita;
+    if (v && v.recorrido && v.recorrido === (ent.recorrido || recorridoId())) return "visita";
+    return "pendiente";
+  }
+  /* Las entregas de Queruclor que este repartidor tiene que resolver hoy:
+     las de los clientes de su ruta (las asigna el recorrido). */
+  function delRecorrido() {
+    const s = app(); const rec = recorridoId();
+    const clientes = new Set(((s && s.peds) || []).map(p => soloNums(p.numeroCliente))), vin = vinculados();
+    return todas().filter(e => !e.rendicion && (vin.has(String(e.remito)) || (rec && e.recorrido === rec) || (porCliente() && clientes.has(soloNums(e.cliente_id)))) &&
+      (e.estado === "pendiente" || !e.rendicion));
+  }
+
+  /* ── La tarjeta ───────────────────────────────────────────────── */
+  const RES = { local_cerrado: "Local cerrado", no_llegue: "No llegué" };
+  function etiquetaDe(ent) {
+    const est = estadoDoc(ent);
+    if (est === "cola") return "guardado en el teléfono · falta sincronizar";
+    if (est === "visita") return RES[ent.ultima_visita.motivo] + " · reprogramar";
+    if (est === "pendiente") return null;
+    if (ent.estado === "rechazado") return "rechazó todo";
+    return Number(ent.cobrado) > 0 ? "entregado · cobró " + pesos(ent.cobrado) : "entregado · no pagó";
+  }
+  function pintarTarjetas() {
+    document.querySelectorAll(".card").forEach(card => {
+      const num = soloNums((card.querySelector(".cnu") || {}).textContent);
+      const ent = entregaDe(num);
+      if (!ent) { card.classList.remove("qr-dual"); return; }
+      const ped = pedidoDe(num);
+      const est = estadoDoc(ent);
+      const firma = ent.remito + "|" + ent.estado + "|" + est + "|" + (ped && ped.entregado ? "1" : "0") + "|" + (ped && ped.visita ? ped.visita.motivo : "");
+      if (card.dataset.qrFirma === firma) return;
+      card.dataset.qrFirma = firma;
+      card.classList.add("qr-dual");
+
+      const amt = card.querySelector(".c-amt");
+      if (amt && !amt.closest(".qrml")) {
+        const caja = document.createElement("div");
+        caja.className = "qrln qrml";
+        amt.parentNode.insertBefore(caja, amt);
+        caja.appendChild(amt);
+        caja.insertAdjacentHTML("afterbegin", '<div class="qrln-h"><span class="qrln-k">HABITUALES</span><span class="qrln-r">factura E-Pyme</span></div>');
+        const badges = card.querySelector(".cbs");
+        const ancla = badges || card.querySelector(".ca");
+        if (ancla) ancla.insertAdjacentElement("afterend", caja);
+      }
+      const cajaML = card.querySelector(".qrml");
+      if (cajaML) {
+        const hecho = !!(ped && (ped.entregado || ped.visita || ped.soloQueruclor));
+        cajaML.classList.toggle("hecho", hecho);
+        let pie = cajaML.querySelector(".qrln-f");
+        if (!pie) { pie = document.createElement("div"); pie.className = "qrln-f"; cajaML.appendChild(pie); }
+        pie.innerHTML = ped && ped.soloQueruclor ? '<span class="qrln-ok">sin artículos habituales en este pedido</span>' : ped && ped.visita ? '<span class="qrln-ok">' + esc(RES[ped.visita.motivo] || "sin entregar") + ' · reprogramar</span>'
+          : (ped && ped.entregado) ? '<span class="qrln-ok">✓ registrado</span>' : '<span class="qrln-go">registrar ›</span>';
+      }
+      let qr = card.querySelector(".qrqr");
+      if (!qr) {
+        qr = document.createElement("div");
+        qr.className = "qrln qrqr";
+        qr.setAttribute("role", "button"); qr.tabIndex = 0;
+        qr.addEventListener("click", e => { e.stopPropagation(); const x = entregaDe(num); if (x) abrirCobro(x.id); });
+        card.appendChild(qr);
+      }
+      const lab = etiquetaDe(ent);
+      qr.classList.toggle("hecho", est === "resuelto" || est === "visita");
+      qr.classList.toggle("cola", est === "cola");
+      qr.innerHTML =
+        '<div class="qrln-h"><span class="qrln-k">QUERUCLOR</span><span class="qrln-r">remito ' + esc(ent.remito) + '</span></div>' +
+        '<div class="c-amt">' + pesos(ent.estado === "pendiente" ? Reparto.aPagar(ent) : ent.total) + '</div>' +
+        (ent.saldo_anterior && ent.estado === "pendiente" ? '<div class="qrln-s">incluye saldo anterior de la cuenta: ' + pesos(ent.saldo_anterior) + '</div>' : '') +
+        '<div class="qrln-f"><span>' + (ent.bultos || 0) + ' caja(s) · ' + esc(ent.vendedor || "—") + '</span>' +
+          (lab ? '<span class="qrln-ok">' + esc(lab) + '</span>' : '<span class="qrln-go">registrar ›</span>') + '</div>';
+      const bs = card.querySelector(".cbs");
+      if (bs && !bs.querySelector(".qr-chip")) bs.insertAdjacentHTML("beforeend", '<span class="b qr-chip">2 entregas</span>');
+    });
+  }
+
+  /* ── La hoja de Queruclor: entrega y cobro ────────────────────── */
+  function abrirCobro(entId) {
+    const ent = todas().find(e => e.id === entId);
+    if (!ent) return;
+    if (ent.estado !== "pendiente") { if (window.toast) toast("Esta entrega ya tiene resultado: " + etiquetaDe(ent)); return; }
+    if (enCola(ent.id).length) { if (window.toast) toast("Ya está guardada en el teléfono: falta sincronizar"); return; }
+
+    const sufijo = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const OP = { dev: "rep|dev|" + ent.id + "|" + sufijo, reg: "rep|reg|" + ent.id + "|" + sufijo, vis: "rep|vis|" + ent.id + "|" + sufijo };
+    const st = { paso: 1, resultado: null, motivo: null, obs: "", forma: null, monto: "", ref: "", error: "", ocupado: false, cajas: {}, cant: {} };
+    let det = null, arts = null, bultos = [], vuelve = 0, vuelveErr = "";
+    try { det = Reparto.detalleCobro(ent); } catch (e) {}
+    const base = () => dinero(det && det.a_cobrar != null ? det.a_cobrar : Reparto.aPagar(ent));
+    /* Lo que vuelve con el repartidor no se cobra hoy: se valoriza con la
+       misma función que usa la base para «a cobrar» (qr_dev_valor). */
+    const aCobrar = () => Math.max(0, dinero(base() - vuelve));
+    function recalcVuelve() {
+      vuelve = 0; vuelveErr = "";
+      if (st.resultado !== "parte" && st.resultado !== "rechazo") return;
+      const items = [];
+      itemsRechazo(st.resultado === "rechazo").forEach(it => {
+        if (!it.bulto) return items.push({ ean: it.ean, cajas: it.cajas || 0, sueltas: it.sueltas || 0 });
+        const b = bultos.find(x => x.codigo === it.bulto);
+        ((b && b.contenido) || []).forEach(u => items.push({ ean: u.ean, cajas: u.cajas || 0, sueltas: u.sueltas || 0 }));
+      });
+      if (!items.length) return;
+      try { vuelve = dinero((QRSrv.rpc("qr_dev_valor", { p_pedido: String(ent.pedido_id), p_items: items }) || {}).bruto); }
+      catch (e) { vuelveErr = "Sin señal: no se pudo calcular el valor de lo que vuelve."; }
+      if (st.todo) st.monto = String(aCobrar());
+    }
+
+    const cap = document.createElement("div");
+    cap.className = "qrbg";
+    cap.innerHTML = '<div class="qrsh" role="dialog" aria-modal="true" aria-label="Entrega y cobro de Queruclor"></div>';
+    cap.addEventListener("click", e => { if (e.target === cap) cerrar(); });
+    document.body.appendChild(cap);
+    const sh = cap.querySelector(".qrsh");
+
+    /* El detalle real del remito (artículos, cajas con su código y contenido).
+       18/10/2026: si no se puede traer, se dice por qué y se ofrece
+       reintentar; nunca se muestra una lista vacía como si se pudiera usar,
+       ni se inventa contenido. Lo que ya se marcó queda en la hoja. */
+    let detalleErr = "";
+    function cargarArticulos() {
+      if (arts) return true;
+      let d;
+      try { d = QRSrv.rpc("qr_dev_pedido", { p_pedido: String(ent.pedido_id) }); }
+      catch (e) { detalleErr = "Sin señal: no se pudo traer el detalle del remito " + ent.remito + ". Lo que elegiste queda en esta hoja; probá de nuevo."; return false; }
+      if (!d) { detalleErr = "No se encontró el detalle del remito " + ent.remito + ": no hay un remito emitido para este pedido (por ejemplo, una entrega de demostración). Sin ese detalle no se puede registrar qué vuelve."; return false; }
+      if (!(d.articulos || []).length) { detalleErr = "El remito " + ent.remito + " no tiene artículos con detalle: no se puede registrar qué vuelve."; return false; }
+      try {
+        bultos = (QRSrv.get("qr_bultos", "remito=eq." + encodeURIComponent(ent.remito) + "&estado=eq.activo&order=n.asc", 0) || [])
+          .filter(b => !(QRSrv.get("qr_dev_bultos", "codigo=eq." + encodeURIComponent(b.codigo), 0) || []).length);
+      } catch (e) { detalleErr = "Sin señal: no se pudieron traer las cajas del remito " + ent.remito + ". Probá de nuevo."; return false; }
+      arts = d.articulos; detalleErr = "";
+      return true;
+    }
+    /* Lo que vuelve: cajas identificadas + cantidades sueltas, sin contar dos veces. */
+    function itemsRechazo(todo) {
+      const items = [];
+      if (todo) {
+        (arts || []).forEach(a => {
+          const c = Math.max(0, a.cajas - a.devuelto_cajas), s = Math.max(0, a.sueltas - a.devuelto_sueltas);
+          if (c || s) items.push({ ean: a.ean, nombre: a.nombre, cajas: c, sueltas: s, sana: true });
+        });
+        return items;
+      }
+      bultos.filter(b => st.cajas[b.codigo]).forEach(b => items.push({ bulto: b.codigo, sana: true }));
+      Object.keys(st.cant).forEach(k => {
+        const [ean, tipo] = k.split("|"); const n = Math.max(0, Math.floor(+st.cant[k] || 0)); if (!n) return;
+        let it = items.find(x => x.ean === ean && !x.bulto);
+        if (!it) { const a = (arts || []).find(x => x.ean === ean) || {}; it = { ean, nombre: a.nombre, cajas: 0, sueltas: 0, sana: true }; items.push(it); }
+        it[tipo] += n;
+      });
+      return items;
+    }
+    /* Máximo por artículo que se puede declarar a mano, descontando las cajas elegidas. */
+    function maximo(a, tipo) {
+      let usado = 0;
+      bultos.filter(b => st.cajas[b.codigo]).forEach(b => (b.contenido || []).forEach(u => { if (u.ean === a.ean) usado += tipo === "cajas" ? (u.cajas || 0) : (u.sueltas || 0); }));
+      const base = tipo === "cajas" ? a.cajas - a.devuelto_cajas : a.sueltas - a.devuelto_sueltas;
+      return Math.max(0, base - usado);
+    }
+    const contenidoTxt = b => (b.contenido || []).map(u => (u.cajas ? u.cajas + " caja " : u.sueltas + " un. ") + (u.nombre || "")).join(" + ") || esc(b.nombre);
+
+    /* Textos del repartidor (18/10/2026). */
+    const RES_TXT = { todo: "Entregué todo", parte: "Entregué una parte", rechazo: "El cliente rechazó todo", visita: "No pude entregar" };
+    const necesitaDetalle = () => st.resultado === "parte" || st.resultado === "rechazo";
+    function botonTexto() {
+      const m = dinero(st.monto);
+      const pago = st.forma && st.forma !== "No pagó" && m > 0;
+      if (!st.resultado) return "Elegí qué pasó con la entrega";
+      if (st.resultado === "visita") return st.motivo ? "Guardar visita: " + RES[st.motivo] : "Elegí el motivo";
+      if (st.paso === 1) {
+        if (necesitaDetalle() && detalleErr) return "Falta el detalle del remito";
+        if (st.resultado === "parte" && !itemsRechazo(false).length) return "Marcá lo que vuelve";
+        return "Continuar al cobro";
+      }
+      if (st.resultado === "rechazo") return pago ? "Confirmar rechazo y cobro de " + pesos(m) : "Confirmar rechazo";
+      const qu = st.resultado === "parte" ? "entrega parcial" : "entrega";
+      if (!st.forma) return "Elegí cómo pagó";
+      return pago ? "Confirmar " + qu + " y cobro de " + pesos(m) : "Confirmar " + qu + " sin pago";
+    }
+    const cant = (c, s) => [c ? c + " caja" + (c === 1 ? "" : "s") : "", s ? s + " un." : ""].filter(Boolean).join(" + ") || "0";
+    const contUnid = b => (b.contenido || []).reduce((a, u) => a + (u.sueltas || 0) + (u.cajas || 0) * (Number(b.uc) || 0), 0);
+
+    /* Lo que vuelve, en palabras: para el paso 2 y el aviso. */
+    function vuelveTxt() {
+      const it = itemsRechazo(st.resultado === "rechazo");
+      let cajas = 0, un = 0;
+      it.forEach(x => {
+        if (x.bulto) { const b = bultos.find(y => y.codigo === x.bulto) || {}; if ((b.tipo || "cerrada") === "cerrada") cajas++; else cajas++; }
+        else { cajas += x.cajas || 0; un += x.sueltas || 0; }
+      });
+      return { n: it.length, txt: cant(cajas, un) };
+    }
+
+    /* Paso 1 · ¿qué entregué? — con «Entregué una parte», el detalle real del remito. */
+    function detalleHTML() {
+      if (detalleErr) return '<div class="qrsh-err" role="alert">' + esc(detalleErr) + '</div>' +
+        '<button type="button" class="qrsh-alt" onclick="qrReintentarDetalle()">↻ Reintentar</button>';
+      if (st.resultado === "rechazo") {
+        return '<div class="qrsh-nota">Vuelve todo lo que salió (' + esc((arts || []).map(a => cant(Math.max(0, a.cajas - a.devuelto_cajas), Math.max(0, a.sueltas - a.devuelto_sueltas)) + " " + a.nombre).join(" · ")) +
+          '). Queda como devolución pendiente: no mueve stock y la nota la emite Caja cuando la mercadería llega al depósito.</div>';
+      }
+      const usados = new Set();
+      const porArt = (arts || []).map(a => {
+        const cajasArt = bultos.filter(b => (b.tipo || "cerrada") === "cerrada" && b.ean === a.ean);
+        cajasArt.forEach(b => usados.add(b.codigo));
+        const mc = maximo(a, "cajas"), ms = maximo(a, "sueltas");
+        const devu = (a.devuelto_cajas || a.devuelto_sueltas) ? ' · ya devuelto ' + cant(a.devuelto_cajas, a.devuelto_sueltas) : '';
+        return '<div class="qrsh-art"><div class="qrsh-art-h"><b>' + esc(a.nombre) + '</b><span>caja x ' + esc(a.uc) + ' · salió ' + cant(a.cajas, a.sueltas) + devu + '</span></div>' +
+          cajasArt.map((b, i) => '<label class="qrsh-caja"><input type="checkbox" data-caja="' + esc(b.codigo) + '"' + (st.cajas[b.codigo] ? " checked" : "") + '>' +
+            /* 26/10/2026: el código de la caja no se muestra (solo vale leído de la etiqueta). */
+            '<span><b>1 caja</b> · ' + esc(a.uc) + ' unidades · caja N° ' + esc(String(b.codigo).split("-").pop()) + ' (el número de la etiqueta)</span></label>').join('') +
+          (mc || ms ? '<div class="qrsh-rf"><div><span>' + (cajasArt.length ? 'o sin caja identificada' : 'cuántas vuelven') + '</span></div>' +
+            (mc ? '<label>cajas <input type="number" min="0" max="' + mc + '" inputmode="numeric" data-k="' + esc(a.ean) + '|cajas" value="' + esc(st.cant[a.ean + "|cajas"] || "") + '"></label>' : '') +
+            (ms ? '<label>un. <input type="number" min="0" max="' + ms + '" inputmode="numeric" data-k="' + esc(a.ean) + '|sueltas" value="' + esc(st.cant[a.ean + "|sueltas"] || "") + '"></label>' : '') + '</div>' : '') +
+          '</div>';
+      }).join('');
+      const surt = bultos.filter(b => !usados.has(b.codigo));
+      const surtHTML = surt.length ? '<div class="qrsh-lbl2">Cajas surtidas</div>' + surt.map((b, i) => '<label class="qrsh-caja"><input type="checkbox" data-caja="' + esc(b.codigo) + '"' + (st.cajas[b.codigo] ? " checked" : "") + '>' +
+        '<span><b>' + esc(b.nombre || "Caja surtida") + '</b> · caja N° ' + esc(String(b.codigo).split("-").pop()) + '<br><small>' + esc((b.contenido || []).map(u => (u.cajas ? cant(u.cajas, 0) : u.sueltas + " un.") + " " + (u.nombre || "")).join(" + ") || "sin contenido registrado") + '</small></span></label>').join('') : '';
+      const v = vuelveTxt();
+      return '<div class="qrsh-lbl">Marcá lo que vuelve</div>' + porArt + surtHTML +
+        (v.n ? '<div class="qrsh-av">⚠ Vuelve ' + esc(v.txt) + ' · nota pendiente de recepción</div>' : '<div class="qrsh-nota">Tocá las cajas que el cliente no se quedó, o poné la cantidad. No hace falta escanear.</div>');
+    }
+
+    function pintar() {
+      const total = aCobrar();
+      const montoN = dinero(st.monto);
+      const cab =
+        '<div class="qrsh-grab"></div>' +
+        '<div class="qrsh-h"><div><div class="qrsh-k">QUERUCLOR · remito ' + esc(ent.remito) + '</div>' +
+          '<div class="qrsh-n">' + esc(ent.cliente_nombre) + '</div><div class="qrsh-sub">Cliente Nº ' + esc(ent.cliente_id) + ' · vendedor ' + esc(ent.vendedor || "—") + '</div></div>' +
+          '<button class="qrsh-x" onclick="qrCobroCerrar()" aria-label="Cerrar">✕</button></div>' +
+        '<div class="qrsh-pasos"><span class="' + (st.paso === 1 ? "on" : "ok") + '">1 · Entrega</span><span class="' + (st.paso === 2 ? "on" : "") + '">2 · Cobro</span></div>' +
+        (st.error ? '<div class="qrsh-err" role="alert">' + esc(st.error) + '</div>' : '');
+      let cuerpo;
+      if (st.paso === 1) {
+        cuerpo = '<div class="qrsh-lbl">¿Qué entregué?</div>' +
+          '<div class="qrsh-res">' + ["todo", "parte", "rechazo", "visita"].map(k => '<button type="button" class="qrsh-f' + (st.resultado === k ? " sel" : "") +
+            (k === "rechazo" || k === "visita" ? " dg" : "") + '" aria-pressed="' + (st.resultado === k) + '" onclick="qrRes(\'' + k + '\')">' + RES_TXT[k] + '</button>').join("") + '</div>' +
+          (st.resultado === "visita" ? '<div class="qrsh-sub2">' +
+            '<div class="qrsh-res2">' + ["local_cerrado", "no_llegue"].map(m => '<button type="button" class="qrsh-f' + (st.motivo === m ? " sel" : "") + '" onclick="qrMotivo(\'' + m + '\')">' + RES[m] + '</button>').join("") + '</div>' +
+            '<label class="qrsh-lab">Observación (opcional)<input class="qrsh-txt" id="qrObs" maxlength="160" value="' + esc(st.obs) + '" placeholder="ej: persiana baja, sin timbre"></label>' +
+            '<div class="qrsh-nota">Queda registrada la visita y la entrega pendiente de reprogramar. No hay entrega, cobro, nota ni movimiento de stock. Las cajas siguen a cargo: no consta que hayan vuelto al depósito.</div></div>' : '') +
+          (necesitaDetalle() ? '<div class="qrsh-sub2">' + detalleHTML() + '</div>' : '');
+      } else {
+        const v = vuelveTxt();
+        cuerpo =
+          '<div class="qrsh-res-ok">' + esc(RES_TXT[st.resultado]) + (necesitaDetalle() && v.n ? ' · vuelve ' + esc(v.txt) : '') +
+            ' <button type="button" class="qrsh-link" onclick="qrPaso(1)">Cambiar</button></div>' +
+          '<div class="qrsh-tot"><div class="qrsh-tl"><span>Importe del remito</span><b>' + pesos(ent.total) + '</b></div>' +
+            (det && det.saldo_anterior ? '<div class="qrsh-tl"><span>Saldo anterior de la cuenta</span><b>' + pesos(det.saldo_anterior) + '</b></div>' : '') +
+            (det && det.notas ? '<div class="qrsh-tl"><span>Notas de crédito emitidas</span><b>− ' + pesos(det.notas) + '</b></div>' : '') +
+            (det && det.rechazado ? '<div class="qrsh-tl ojo"><span>Devoluciones anteriores pendientes de nota (no son crédito todavía)</span><b>− ' + pesos(det.rechazado) + '</b></div>' : '') +
+            (necesitaDetalle() ? '<div class="qrsh-tl ojo"><span>Vuelve con vos hoy (no se cobra)</span><b id="qrVuelveV">− ' + pesos(vuelve) + '</b></div>' +
+              (vuelveErr ? '<div class="qrsh-tl ojo"><span>' + esc(vuelveErr) + '</span></div>' : '') : '') +
+            '<div class="qrsh-tl fuerte"><span>A cobrar hoy</span><b id="qrACobrar">' + pesos(total) + '</b></div>' +
+            (necesitaDetalle() && v.n ? '<div class="qrsh-tl chico"><span>La cuenta del cliente no baja hasta que Caja emita la nota (con la mercadería recibida).</span></div>' : '') + '</div>' +
+          '<div class="qrsh-lbl">¿Cómo pagó?</div>' +
+          '<div class="qrsh-formas">' + ["Efectivo", "Transferencia", "Cheque", "No pagó"].map(f => '<button type="button" class="qrsh-f' + (st.forma === f ? " sel" : "") + '" aria-pressed="' + (st.forma === f) + '" onclick="qrCobroForma(\'' + f + '\')">' + f + '</button>').join("") + '</div>' +
+          (st.forma && st.forma !== "No pagó" ? '<div class="qrsh-montos"><button type="button" class="qrsh-mt" onclick="qrCobroTodo()">Pagó todo</button>' +
+            '<input class="qrsh-inp" id="qrMonto" type="number" inputmode="decimal" min="0" step="0.01" placeholder="Importe recibido" value="' + esc(st.monto) + '" aria-label="Importe recibido"></div>' +
+            (st.forma !== "Efectivo" ? '<input class="qrsh-txt" id="qrRef" maxlength="80" value="' + esc(st.ref) + '" placeholder="' + (st.forma === "Cheque" ? "Banco y número del cheque (opcional)" : "Referencia de la transferencia (opcional)") + '">' : '') +
+            '<div class="qrsh-calc">Cobro ' + pesos(montoN) + ' · queda pendiente ' + pesos(Math.max(0, total - montoN)) +
+              (montoN > total ? ' · pagó de más: ' + pesos(montoN - total) + ' queda a favor del cliente' : '') + '</div>' +
+            (st.forma === "Transferencia" ? '<div class="qrsh-nota">Una transferencia declarada no está verificada: la confirma Administración en el banco y no suma al efectivo.</div>' : '') : '');
+      }
+      const listo1 = st.paso === 1 && st.resultado && (st.resultado === "visita" ? !!st.motivo : !(necesitaDetalle() && detalleErr) && !(st.resultado === "parte" && !itemsRechazo(false).length));
+      sh.innerHTML = cab + '<div class="qrsh-cuerpo">' + cuerpo + '</div>' +
+        '<div class="qrsh-pie">' + (st.paso === 2 ? '<button type="button" class="qrsh-alt" onclick="qrPaso(1)">← Volver</button>' : '') +
+        '<button class="qrsh-ok" id="qrOk" onclick="qrCobroGuardar()"' + (st.ocupado || (st.paso === 1 && !listo1 && st.resultado) ? " disabled" : "") + '>' + esc(st.ocupado ? "Guardando…" : botonTexto()) + '</button></div>';
+      const m = sh.querySelector("#qrMonto"); if (m) m.oninput = () => { st.monto = m.value; st.todo = false; actualizarCalc(); };
+      const r = sh.querySelector("#qrRef"); if (r) r.oninput = () => { st.ref = r.value; };
+      const o = sh.querySelector("#qrObs"); if (o) o.oninput = () => { st.obs = o.value; };
+      sh.querySelectorAll("[data-caja]").forEach(c => { c.onchange = () => { st.cajas[c.dataset.caja] = c.checked; recalcVuelve(); pintar(); }; });
+      sh.querySelectorAll("[data-k]").forEach(i => {
+        i.oninput = () => { st.cant[i.dataset.k] = i.value; recalcVuelve(); actualizarCalc(); };
+        i.onchange = () => { const pos = i.dataset.k; pintar(); const n = sh.querySelector('[data-k="' + pos + '"]'); if (n && document.activeElement === document.body) n.focus(); };
+      });
+    }
+    function actualizarCalc() {
+      const total = aCobrar(), montoN = dinero(st.monto);
+      const vv = sh.querySelector("#qrVuelveV"); if (vv) vv.textContent = "− " + pesos(vuelve);
+      const ac = sh.querySelector("#qrACobrar"); if (ac) ac.textContent = pesos(total);
+      const mi = sh.querySelector("#qrMonto"); if (mi && st.todo && document.activeElement !== mi) mi.value = st.monto;
+      const c = sh.querySelector(".qrsh-calc");
+      if (c) c.textContent = "Cobro " + pesos(montoN) + " · queda pendiente " + pesos(Math.max(0, total - montoN)) + (montoN > total ? " · pagó de más: " + pesos(montoN - total) + " queda a favor del cliente" : "");
+      const b = sh.querySelector("#qrOk"); if (b && !st.ocupado) {
+        b.textContent = botonTexto();
+        if (st.paso === 1) b.disabled = st.resultado === "parte" && !itemsRechazo(false).length;
+      }
+    }
+
+    const cerrar = () => { cap.classList.add("out"); setTimeout(() => cap.remove(), 180); };
+    function cerrarYSeguir() {
+      cerrar(); refrescar();
+      const i = indiceDe(ent.cliente_id); const ped = pedidoDe(ent.cliente_id);
+      if (i >= 0 && ped && !ped.soloQueruclor && !ped.entregado && !ped.visita && typeof window.openModal === "function") {
+        setTimeout(() => { if (window.toast) toast("Falta registrar Habituales de este cliente"); openModal(i); }, 320);
+      }
+    }
+
+    window.qrCobroCerrar = cerrar;
+    window.qrRes = k => {
+      st.resultado = k; st.error = "";
+      if (k === "parte" || k === "rechazo") cargarArticulos();
+      if (k === "visita") st.forma = null;
+      recalcVuelve(); pintar();
+    };
+    window.qrReintentarDetalle = () => { arts = null; cargarArticulos(); recalcVuelve(); pintar(); };
+    window.qrPaso = n => { st.paso = n; st.error = ""; pintar(); };
+    window.qrMotivo = m => { st.motivo = m; pintar(); };
+    window.qrCobroForma = f => { st.forma = f; if (f === "No pagó") st.monto = ""; pintar(); const m = sh.querySelector("#qrMonto"); if (m) m.focus(); };
+    window.qrCobroTodo = () => { st.todo = true; st.monto = String(aCobrar()); pintar(); };
+
+    window.qrCobroGuardar = () => {
+      if (st.ocupado || st.hecho) return;             // doble toque (también después de guardar, mientras la hoja se cierra)
+      st.error = "";
+      const monto = dinero(st.monto);
+      if (!st.resultado) { st.error = "Elegí qué pasó con la entrega."; return pintar(); }
+      if (st.resultado === "visita") {
+        if (!st.motivo) { st.error = "Elegí el motivo: Local cerrado o No llegué."; return pintar(); }
+        const s = app() || {};
+        st.ocupado = true; pintar();
+        const r = ejecutar({ id: OP.vis, tipo: "visita", ent: ent.id, cliente: ent.cliente_nombre,
+          payload: { op: OP.vis, entrega_id: ent.id, motivo: st.motivo, obs: st.obs, repartidor: s.rep || "", turno: s.turno || "", recorrido: recorridoId() } });
+        st.ocupado = false;
+        if (r && r.ok === false) { st.error = r.motivo || "No se guardó."; return pintar(); }
+        st.hecho = true;
+        if (window.toast) toast(r && r.encolada ? "📴 Sin señal: la visita quedó en el teléfono, se sincroniza sola" : "Visita registrada: " + RES[st.motivo] + " · queda para reprogramar", 5000);
+        return cerrarYSeguir();
+      }
+      if (st.paso === 1) {
+        if (necesitaDetalle() && !cargarArticulos()) return pintar();
+        if (st.resultado === "parte" && !itemsRechazo(false).length) { st.error = "Marcá qué cajas o cantidades no se quedó el cliente (o elegí «Entregué todo»)."; return pintar(); }
+        recalcVuelve(); st.paso = 2; return pintar();
+      }
+      if (st.resultado !== "rechazo" && !st.forma) { st.error = "Elegí cómo pagó (o «No pagó»)."; return pintar(); }
+      if (st.forma && st.forma !== "No pagó" && !(monto > 0)) { st.error = "Poné el importe que recibiste, o tocá «Pagó todo»."; return pintar(); }
+      if (st.forma && st.forma !== "No pagó" && monto > aCobrar() + 0.009 &&
+        !confirm("Cobró " + pesos(monto) + " y había que cobrar " + pesos(aCobrar()) + ". La diferencia queda a favor del cliente. ¿Es correcto?")) return;
+      let items = null;
+      if (st.resultado === "parte" || st.resultado === "rechazo") {
+        if (!cargarArticulos()) { st.paso = 1; return pintar(); }
+        items = itemsRechazo(st.resultado === "rechazo");
+        if (st.resultado === "parte" && !items.length) { st.paso = 1; st.error = "Marcá qué cajas o cantidades no se quedó el cliente (o elegí «Entregué todo»)."; return pintar(); }
+      }
+      st.ocupado = true; pintar();
+      /* 1 · la mercadería que vuelve (devolución pendiente: sin nota, sin stock). */
+      if (items && items.length) {
+        const rd = ejecutar({ id: OP.dev, tipo: "dev", ent: ent.id, cliente: ent.cliente_nombre,
+          payload: { op: OP.dev, tipo: "alta", pedido_id: String(ent.pedido_id), items, quien: quienRep(), origen: "reparto" } });
+        if (rd && rd.ok === false) { st.ocupado = false; st.error = rd.motivo || "No se pudo registrar lo que vuelve."; return pintar(); }
+      }
+      /* 2 · el resultado y el cobro declarado. */
+      const pago = st.forma && st.forma !== "No pagó" ? monto : 0;
+      const nota = st.ref ? (st.forma + ": " + st.ref) : "";
+      const rr = ejecutar({ id: OP.reg, tipo: "registrar", ent: ent.id, cliente: ent.cliente_nombre,
+        payload: { id: ent.id, estado: st.resultado === "rechazo" ? "rechazado" : "entregado", rechazado: st.resultado === "rechazo",
+          cobrado: pago, forma: pago ? st.forma : "", nota, quien: quienRep(), recorrido: recorridoId(), fecha_cobro: new Date().toISOString() } });
+      st.ocupado = false; st.hecho = true;
+      if (window.vib) vib(80);
+      if (window.toast) toast(rr && rr.encolada ? "📴 Sin señal: quedó guardado en el teléfono y se sincroniza solo (no se duplica)"
+        : st.resultado === "rechazo" ? "Rechazo registrado: la nota la hace Caja cuando llega la mercadería"
+        : pago ? "✅ Queruclor: " + (st.resultado === "parte" ? "entrega parcial" : "entregado") + " · cobró " + pesos(pago) : "✅ Queruclor entregado sin pago", 4500);
+      cerrarYSeguir();
+    };
+
+    pintar();
+    requestAnimationFrame(() => cap.classList.add("in"));
+  }
+
+  function refrescar() {
+    try { asignarRecorrido(); } catch (e) {}
+    try { pintarTarjetas(); } catch (e) { console.warn("[qr]", e); }
+    if (window.qrUnificadoRefrescar) try { qrUnificadoRefrescar(); } catch (e) {}
+  }
+
+  /* ── El encadenado: al confirmar Habituales, se abre Queruclor ─── */
+  function engancharConfirmacion() {
+    if (typeof window.confirmDel !== "function" || window.confirmDel.__qr) return;
+    const orig = window.confirmDel;
+    const envuelta = function () {
+      let num = null;
+      const s = app();
+      if (s && s.mi >= 0 && s.peds[s.mi]) num = s.peds[s.mi].numeroCliente;
+      if (!num) { const t = document.getElementById("mTi"); const m = t && t.textContent.match(/N[ºo°]\s*(\d+)/i); if (m) num = m[1]; }
+      const r = orig.apply(this, arguments);
+      setTimeout(() => {
+        const ped = pedidoDe(num);
+        if (!ped || !(ped.entregado || ped.visita)) return;
+        const ent = entregaDe(num);
+        if (!ent || estadoDoc(ent) !== "pendiente") return;
+        if (window.toast) toast("Falta registrar Queruclor de este cliente");
+        abrirCobro(ent.id);
+      }, 380);
+      return r;
+    };
+    envuelta.__qr = true;
+    window.confirmDel = envuelta;
+    const b = document.getElementById("mOk");
+    if (b && !b.dataset.qrRe) {
+      b.dataset.qrRe = "1";
+      const clon = b.cloneNode(true);
+      b.parentNode.replaceChild(clon, b);
+      clon.addEventListener("click", () => window.confirmDel());
+    }
+  }
+
+  /* ── Estilos: el mismo lenguaje para Habituales y Queruclor ───── */
+  const st = document.createElement("style");
+  st.textContent = `
+    :root{ --qr:#0b2a5b; --qrbg:#eef5fd; --qrbd:#bcd6f3; --mlc:#0d7a4a; --mlbg:#edfaf2 }
+    .card.qr-dual .qrln{ position:relative; margin:10px 0 0; padding:9px 12px 10px; border-radius:var(--rs,12px);
+      border:1px solid var(--bd,#dce0e8); border-left-width:4px; box-sizing:border-box }
+    .card.qr-dual .qrln .c-amt{ margin:1px 0 0 !important; font-size:20px !important }
+    .card.qr-dual .qrml{ border-left-color:var(--mlc); background:var(--mlbg) }
+    .card.qr-dual .qrqr{ border-left-color:var(--qr); background:var(--qrbg); cursor:pointer }
+    .card.qr-dual .qrqr:active{ filter:brightness(.97) }
+    .card.qr-dual .qrqr:focus-visible{ outline:3px solid #2563eb; outline-offset:2px }
+    .card.qr-dual .qrln.hecho{ opacity:.66 }
+    .card.qr-dual .qrqr.cola{ border-left-color:#b45309; background:#fff7ed }
+    .qrln-h{ display:flex; align-items:center; gap:7px }
+    .qrln-k{ font-size:10px; font-weight:800; letter-spacing:.1em }
+    .qrml .qrln-k{ color:var(--mlc) } .qrqr .qrln-k{ color:var(--qr) }
+    .qrln-r{ font-size:10.5px; color:var(--tx3,#6b7280); font-family:var(--m,monospace) }
+    .qrln-s{ font-size:11px; font-weight:700; color:var(--wn,#a16207); margin-top:1px }
+    .qrln-f{ display:flex; align-items:center; gap:8px; margin-top:4px; font-size:11.5px; color:var(--tx2,#4b5563); flex-wrap:wrap }
+    .qrln-go{ margin-left:auto; font-weight:800 }
+    .qrml .qrln-go{ color:var(--mlc) } .qrqr .qrln-go{ color:var(--qr) }
+    .qrln-ok{ margin-left:auto; font-weight:800; color:var(--tx2,#4b5563) }
+    .b.qr-chip{ background:var(--qrbg); color:var(--qr); border:1px solid var(--qrbd) }
+
+    .qrbg{ position:fixed; inset:0; z-index:100000; background:rgba(20,23,32,.5); display:flex; align-items:flex-end; justify-content:center;
+      opacity:0; transition:opacity .18s }
+    .qrbg.in{ opacity:1 } .qrbg.out{ opacity:0 }
+    .qrsh{ background:var(--sf,#fff); width:100%; max-width:560px; box-sizing:border-box; border-radius:22px 22px 0 0;
+      padding:8px 18px calc(24px + env(safe-area-inset-bottom)); max-height:94vh; max-height:94dvh; overflow-y:auto;
+      transform:translateY(16px); transition:transform .2s; box-shadow:var(--shl,0 8px 24px rgba(0,0,0,.1)) }
+    @media (min-width:700px){ .qrbg{ align-items:center } .qrsh{ border-radius:18px } }
+    .qrbg.in .qrsh{ transform:translateY(0) }
+    .qrsh *{ box-sizing:border-box }
+    .qrsh-grab{ width:38px; height:4px; border-radius:99px; background:var(--sf3,#e6e8ed); margin:0 auto 14px }
+    .qrsh-h{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px }
+    .qrsh-k{ font-size:10px; font-weight:800; letter-spacing:.1em; color:var(--qr) }
+    .qrsh-n{ font-size:18px; font-weight:800; color:var(--tx,#141720); line-height:1.2; margin-top:2px }
+    .qrsh-sub{ font-size:12px; color:var(--tx2,#4b5563) }
+    .qrsh-x{ flex:0 0 40px; width:40px; height:40px; border:0; border-radius:10px; background:var(--sf2,#f0f1f5); color:var(--tx2,#4b5563); font-size:15px; cursor:pointer }
+    .qrsh-tot{ background:var(--qrbg); border-radius:var(--rs,12px); padding:10px 14px; margin:12px 0 }
+    .qrsh-tl{ display:flex; justify-content:space-between; gap:10px; font-size:13px; padding:2px 0; color:var(--tx2,#374151) }
+    .qrsh-tl b{ font-variant-numeric:tabular-nums; white-space:nowrap } .qrsh-tl.ojo{ color:#a16207 }
+    .qrsh-tl.fuerte{ border-top:1px solid var(--qrbd); margin-top:4px; padding-top:6px; font-size:15px; color:var(--tx,#111827) }
+    .qrsh-tl.fuerte b{ font-size:22px }
+    .qrsh-lbl{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:var(--tx2,#4b5563); margin:16px 0 7px }
+    .qrsh-lbl2{ font-size:11px; font-weight:800; color:var(--tx2,#4b5563); margin:10px 0 4px }
+    .qrsh-res, .qrsh-formas{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px }
+    .qrsh-res2{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:8px 0 }
+    .qrsh-f{ min-height:50px; padding:10px 6px; border:2px solid var(--bd,#dce0e8); background:var(--sf,#fff); border-radius:var(--rs,12px);
+      font:inherit; font-size:14px; font-weight:700; color:var(--tx,#1f2937); cursor:pointer }
+    .qrsh-f.sel{ border-color:var(--qr); background:var(--qrbg); color:var(--qr) }
+    .qrsh-f.dg.sel{ border-color:#b91c1c; background:#fef2f2; color:#991b1b }
+    .qrsh-f:focus-visible, .qrsh-ok:focus-visible, .qrsh-mt:focus-visible{ outline:3px solid #2563eb; outline-offset:2px }
+    .qrsh-sub2{ margin-top:8px }
+    .qrsh-lab{ display:block; font-size:12px; font-weight:700; color:var(--tx2,#4b5563); margin-top:6px }
+    .qrsh-txt{ width:100%; margin-top:6px; padding:12px; border:1.5px solid var(--bd,#dce0e8); border-radius:var(--rs,12px); font:inherit; font-size:15px }
+    .qrsh-nota{ font-size:12.5px; color:var(--tx2,#4b5563); background:var(--sf2,#f5f6f8); border-radius:10px; padding:8px 10px; margin-top:8px; line-height:1.45 }
+    .qrsh-caja{ display:flex; gap:10px; align-items:flex-start; border:1.5px solid var(--bd,#dce0e8); border-radius:10px; padding:9px 10px; margin-bottom:6px; font-size:13px; cursor:pointer }
+    .qrsh-caja input{ width:22px; height:22px; margin-top:1px }
+    .qrsh-montos{ display:grid; grid-template-columns:auto 1fr; gap:8px; margin-top:10px }
+    .qrsh-mt{ padding:0 14px; border:2px solid var(--bd,#dce0e8); background:var(--sf,#fff); border-radius:var(--rs,12px); font:inherit; font-size:14px; font-weight:800; color:var(--qr); cursor:pointer; white-space:nowrap; min-height:52px }
+    .qrsh-inp{ width:100%; min-width:0; padding:13px; border:2px solid var(--bd,#dce0e8); border-radius:var(--rs,12px); font:inherit; font-size:20px; font-weight:800; text-align:center; font-variant-numeric:tabular-nums }
+    .qrsh-calc{ font-size:12.5px; color:var(--tx2,#374151); margin-top:7px; font-variant-numeric:tabular-nums }
+    .qrsh-ok{ width:100%; margin-top:16px; min-height:54px; padding:14px; border:0; border-radius:var(--rs,12px); background:var(--qr); color:#fff; font:inherit; font-size:16px; font-weight:800; cursor:pointer }
+    .qrsh-ok:disabled{ opacity:.6 }
+    .qrsh-rf{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:9px 0; border-bottom:1px solid #f1f5f9 }
+    .qrsh-rf > div{ flex:1; min-width:150px } .qrsh-rf b{ display:block; font-size:14px } .qrsh-rf span{ font-size:12px; color:#4b5563 }
+    .qrsh-rf label{ font-size:12px; display:flex; gap:4px; align-items:center }
+    .qrsh-rf input{ width:68px; padding:10px; border:2px solid #e2e8f0; border-radius:9px; font:inherit; font-size:15px }
+    .qrsh-err{ background:#fee2e2; color:#991b1b; border-radius:9px; padding:9px 11px; font-size:13px; font-weight:700; margin:6px 0 }
+    @media (prefers-reduced-motion: reduce){ .qrbg, .qrsh{ transition:none } }
+    /* 18/10/2026 — dos pasos y pie fijo: el botón principal nunca queda tapado. */
+    .qrsh{ padding-bottom:0 }
+    .qrsh-pasos{ display:flex; gap:6px; margin:8px 0 4px; font-size:11.5px; font-weight:800; letter-spacing:.04em; text-transform:uppercase }
+    .qrsh-pasos span{ flex:1; padding:5px 8px; border-radius:99px; background:var(--sf2,#f1f5f9); color:#64748b; text-align:center }
+    .qrsh-pasos span.on{ background:var(--qr); color:#fff } .qrsh-pasos span.ok{ background:#dcfce7; color:#166534 }
+    .qrsh-pie{ position:sticky; bottom:0; display:flex; gap:8px; background:var(--sf,#fff); padding:10px 0 calc(14px + env(safe-area-inset-bottom));
+      margin-top:10px; border-top:1px solid #eef0f4 }
+    .qrsh-pie .qrsh-ok{ margin-top:0; flex:1 } .qrsh-ok:disabled{ background:#94a3b8; cursor:not-allowed }
+    .qrsh-alt{ min-height:54px; padding:0 14px; border:2px solid var(--bd,#dce0e8); background:var(--sf,#fff); border-radius:var(--rs,12px);
+      font:inherit; font-size:14px; font-weight:800; color:var(--qr); cursor:pointer }
+    .qrsh-alt:focus-visible, .qrsh-link:focus-visible{ outline:3px solid #2563eb; outline-offset:2px }
+    .qrsh-art{ border:1px solid #e2e8f0; border-radius:12px; padding:8px 10px; margin:8px 0 }
+    .qrsh-art-h b{ display:block; font-size:14.5px } .qrsh-art-h span{ font-size:12px; color:#475569 }
+    .qrsh-art .qrsh-caja{ margin:6px 0 0 } .qrsh-art .qrsh-rf{ border-bottom:0; padding:6px 0 0 }
+    .qrsh-caja code{ font-size:12px; background:#f1f5f9; padding:1px 5px; border-radius:5px }
+    .qrsh-caja small{ color:#475569 }
+    .qrsh-av{ margin-top:10px; padding:10px 12px; border-radius:10px; background:#fef3c7; color:#92400e; font-weight:800; font-size:13.5px }
+    .qrsh-res-ok{ margin:10px 0 6px; padding:9px 12px; border-radius:10px; background:var(--qrbg); color:var(--qr); font-weight:800; font-size:14px;
+      display:flex; justify-content:space-between; align-items:center; gap:8px }
+    .qrsh-link{ background:none; border:0; color:#1d4ed8; font:inherit; font-size:13px; font-weight:800; text-decoration:underline; cursor:pointer; padding:4px }
+    .qrsh-tl.chico span{ font-size:12px; color:#475569; font-weight:600 }
+  `;
+  document.head.appendChild(st);
+
+  function enganchar() {
+    if (typeof window.render === "function" && !window.render.__qr) {
+      const orig = window.render;
+      const envuelta = function () { const r = orig.apply(this, arguments); refrescar(); return r; };
+      envuelta.__qr = true;
+      window.render = envuelta;
+    }
+    engancharConfirmacion();
+    refrescar();
+  }
+  document.addEventListener("DOMContentLoaded", enganchar);
+  setTimeout(enganchar, 600);
+  setInterval(enganchar, 2500);
+
+  window.QRReparto = { todas, entregaDe, abrirCobro, refrescar, estadoDoc, delRecorrido, recorridoId, leerCola, sincronizar,
+    errorSync: () => errorSync, pedidoDe, etiquetaDe, invalidar };
+
+})();
+
+</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   REPARTO — mismo lenguaje para Habituales y Queruclor, recorrido y rendición
+
+   18/10/2026. Se agrega por encima de la app de siempre (GestionRepartoML),
+   sin tocar su contabilidad ni E-Pyme:
+     · Habituales: arriba del cobro, «¿Qué pasó con la entrega?» con las
+       mismas cuatro respuestas que Queruclor. Se guarda en sus campos de
+       siempre (devolución + nota); «No se pudo entregar» guarda la visita
+       (motivo, observación, fecha, turno, repartidor) y NO marca entregado.
+     · Contador claro: visitas (clientes) y documentos, por separado. Una
+       visita está completa cuando TODOS sus documentos tienen resultado.
+     · Rendición: se puede enviar con entregas pendientes informadas (Local
+       cerrado / No llegué); una sin registrar la bloquea con la
+       explicación. Antes de enviar, un resumen con lo entregado, lo que
+       vuelve, el efectivo declarado, los cheques uno por uno y las
+       transferencias aparte (no suman al efectivo).
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const mn = n => (Math.round((Number(n) || 0) * 100) / 100).toLocaleString("es-AR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pesos = n => "$" + mn(n);
+  const app = () => (typeof S !== "undefined" && S ? S : null);
+  const soloNums = s => String(s || "").replace(/[^\d]/g, "");
+  const QRR = () => window.QRReparto || null;
+  const RES = { local_cerrado: "Local cerrado", no_llegue: "No llegué" };
+
+  /* ── Habituales: resultado de la entrega en el modal de siempre ── */
+  let res = null, motivo = null;
+  const esRechazoTotal = p => !!(p && p.devolucion && /^RECHAZÓ TODO/i.test(String(p.notasDevolucion || "")));
+  function resultadoML(p) {
+    if (!p) return "sin";
+    if (p.entregado) return esRechazoTotal(p) ? "rechazo" : p.devolucion ? "parte" : "todo";
+    if (p.visita) return "visita";
+    return "sin";
+  }
+  function bloqueResultado() {
+    let b = $("mlRes");
+    if (b) return b;
+    const pg = $("pG"); if (!pg) return null;
+    const lbl = pg.previousElementSibling;
+    b = document.createElement("div");
+    b.id = "mlRes";
+    (lbl && lbl.classList.contains("plbl") ? lbl : pg).insertAdjacentElement("beforebegin", b);
+    if (lbl && lbl.classList.contains("plbl")) lbl.id = "mlCobroLbl";
+    return b;
+  }
+  function pintarML() {
+    const b = bloqueResultado(); if (!b) return;
+    const s = app(); const p = s && s.peds[s.mi];
+    b.innerHTML = `<div class="plbl un-k">HABITUALES · factura E-Pyme</div>
+      <div class="plbl">1 · ¿Qué pasó con la entrega?</div>
+      <div class="un-res">${[["todo", "Entregué todo"], ["parte", "Entregué una parte"], ["rechazo", "El cliente rechazó todo"], ["visita", "No pude entregar"]]
+        .map(([k, t]) => `<button type="button" class="un-b${res === k ? " sel" : ""}${k === "rechazo" || k === "visita" ? " dg" : ""}" data-res="${k}" aria-pressed="${res === k}">${t}</button>`).join("")}</div>
+      ${res === "visita" ? `<div class="un-res un-res2">${["local_cerrado", "no_llegue"].map(m => `<button type="button" class="un-b${motivo === m ? " sel" : ""}" data-mot="${m}">${RES[m]}</button>`).join("")}</div>
+        <textarea id="mlObs" class="un-obs" maxlength="160" placeholder="Observación (opcional)">${esc(p && p.visita ? p.visita.obs || "" : "")}</textarea>
+        <div class="un-nota">Queda registrada la visita y la entrega pendiente de reprogramar: no hay entrega, cobro ni devolución.</div>` : ""}
+      ${res === "parte" ? `<div class="un-nota">Anotá abajo qué devolvió (queda como devolución, como siempre).</div>` : ""}
+      ${res === "rechazo" ? `<div class="un-nota">Vuelve todo. Si además pagó algo de antes, registralo en Caja.</div>` : ""}
+      ${res && res !== "visita" && res !== "rechazo" ? `<div class="plbl">2 · ¿Cobró?</div>` : ""}`;
+    b.querySelectorAll("[data-res]").forEach(x => { x.onclick = () => elegirRes(x.dataset.res); });
+    b.querySelectorAll("[data-mot]").forEach(x => { x.onclick = () => { motivo = x.dataset.mot; pintarML(); }; });
+    const cobro = res && res !== "visita" && res !== "rechazo";
+    ["mlCobroLbl", "pG", "p2T"].forEach(id => { const e = $(id); if (e) e.style.display = cobro ? "" : "none"; });
+    if (!cobro) { const a = $("aR"); if (a) a.style.display = "none"; const i = $("aI"); if (i) i.classList.remove("show"); const p2 = $("p2S"); if (p2) p2.classList.remove("show"); }
+    const dtg = $("dTg"); if (dtg) dtg.style.display = "none";
+    const dnt = $("dNt"); if (dnt) dnt.classList.toggle("show", res === "parte" || res === "rechazo");
+    const ok = $("mOk");
+    if (ok && !ok.disabled) ok.textContent = res === "visita" ? (motivo ? "💾 Guardar visita: " + RES[motivo] : "Elegí el motivo")
+      : res === "rechazo" ? "✅ Confirmar rechazo" : !res ? "Elegí qué pasó con la entrega"
+      : (s && s.fp1 === "No pagó") ? "✅ Confirmar entrega sin pago" : (s && s.fp1) ? "✅ Confirmar entrega y cobro" : "✅ Confirmar entrega";
+  }
+  function elegirRes(k) {
+    res = k;
+    const mDv = $("mDv"), nt = $("mNt");
+    if (mDv) mDv.checked = k === "parte" || k === "rechazo";
+    if (k === "rechazo" && nt && !/^RECHAZÓ TODO/i.test(nt.value)) nt.value = "RECHAZÓ TODO" + (nt.value.trim() ? ": " + nt.value.trim() : "");
+    if (k !== "rechazo" && nt && /^RECHAZÓ TODO:? ?/i.test(nt.value)) nt.value = nt.value.replace(/^RECHAZÓ TODO:? ?/i, "");
+    if (k !== "visita") motivo = null;
+    pintarML();
+  }
+  function engancharModal() {
+    if (typeof window.openModal === "function" && !window.openModal.__un) {
+      const orig = window.openModal;
+      window.openModal = function (i) {
+        const r = orig.apply(this, arguments);
+        const p = app() && app().peds[i];
+        res = p && p.visita ? "visita" : (p && p.entregado ? resultadoML(p) : null);
+        motivo = p && p.visita ? p.visita.motivo : null;
+        pintarML();
+        return r;
+      };
+      window.openModal.__un = true;
+    }
+    if (typeof window.confirmDel === "function" && !window.confirmDel.__un) {
+      const orig = window.confirmDel;
+      const env = function () {
+        const s = app(); if (!s || s.mi < 0) return orig.apply(this, arguments);
+        const p = s.peds[s.mi]; if (!p || p.entregado) return orig.apply(this, arguments);
+        if (!res) { if (window.toast) toast("Elegí qué pasó con la entrega"); return; }
+        if (res === "visita") return guardarVisitaML(p);
+        if (p.visita) { p.visitas = (p.visitas || []).concat([p.visita]); delete p.visita; }
+        return orig.apply(this, arguments);
+      };
+      env.__un = true; env.__qr = window.confirmDel.__qr;
+      window.confirmDel = env;
+    }
+    /* El texto del botón sigue al cobro elegido. */
+    ["pG", "aF", "aO"].forEach(id => { const e = $(id); if (e && !e.dataset.un) { e.dataset.un = "1"; e.addEventListener("click", () => setTimeout(pintarML, 0)); } });
+  }
+  function guardarVisitaML(p) {
+    if (!motivo) { if (window.toast) toast("Elegí el motivo: Local cerrado o No llegué"); return; }
+    const s = app();
+    p.visita = { motivo, obs: (($("mlObs") || {}).value || "").trim(), fecha: new Date().toISOString(), rep: s.rep, turno: s.turno };
+    p.entregado = false;
+    if (typeof closeM === "function") closeM();
+    if (typeof render === "function") render();
+    try { if (typeof cL === "function") cL(); } catch (e) {}
+    try { if (typeof push1 === "function") push1(p); } catch (e) {}
+    try { if (typeof gp === "function") gp({ action: "guardarDatosReparto", pedidos: [p] }).catch(() => { if (typeof qR === "function") qR(p); }); } catch (e) {}
+    if (window.toast) toast("Visita registrada: " + RES[motivo] + " · queda para reprogramar", 4500);
+  }
+
+  /* ── El recorrido de hoy: documentos y visitas ─────────────────── */
+  /* El nombre del cliente: el de la lista del día si el remito no lo trae. */
+  function nomQ(e) {
+    const s = app(); const p = s && (s.peds || []).find(x => soloNums(x.numeroCliente) === soloNums(e.cliente_id));
+    return (p && p.nombre) || e.cliente_nombre || ("Cliente " + e.cliente_id);
+  }
+  function documentos() {
+    const s = app(); const docs = [];
+    ((s && s.peds) || []).filter(p => !p.soloQueruclor).forEach(p => docs.push({ circuito: "Habituales", cliente: soloNums(p.numeroCliente), nombre: p.nombre, ref: p, estado: resultadoML(p) === "sin" ? "sin" : resultadoML(p) === "visita" ? "visita" : "resuelto" }));
+    const q = QRR();
+    if (q) q.delRecorrido().forEach(e => {
+      const est = q.estadoDoc(e);
+      docs.push({ circuito: "Queruclor", cliente: soloNums(e.cliente_id), nombre: nomQ(e), ref: e,
+        estado: est === "pendiente" ? "sin" : est === "visita" ? "visita" : est === "cola" ? "cola" : "resuelto" });
+    });
+    return docs;
+  }
+  function conteo() {
+    const docs = documentos();
+    const porCli = {};
+    docs.forEach(d => { (porCli[d.cliente] = porCli[d.cliente] || []).push(d); });
+    const clis = Object.keys(porCli);
+    const completas = clis.filter(c => porCli[c].every(d => d.estado !== "sin" && d.estado !== "cola")).length;
+    return { docs, clis: clis.length, completas, conResultado: docs.filter(d => d.estado === "resuelto" || d.estado === "visita").length,
+      sin: docs.filter(d => d.estado === "sin"), cola: docs.filter(d => d.estado === "cola") };
+  }
+  function pintarContador() {
+    const s = app(); if (!s || !Array.isArray(s.peds) || !s.peds.length) { const v = $("unCont"); if (v) v.remove(); return; }
+    let box = $("unCont");
+    if (!box) { box = document.createElement("div"); box.id = "unCont"; const c = $("cC"); if (!c) return; c.parentNode.insertBefore(box, c); }
+    const k = conteo();
+    const q = QRR(); const cola = q ? q.leerCola().length : 0; const err = q ? q.errorSync() : "";
+    let rq = 0; try { rq = JSON.parse(localStorage.getItem("rq") || "[]").length; } catch (e) {}
+    box.innerHTML = `<div class="un-cont" role="status">
+      <div><b>${k.completas} de ${k.clis}</b> visitas completas · <b>${k.conResultado} de ${k.docs.length}</b> documentos con resultado</div>
+      ${k.sin.length ? `<button type="button" class="un-falta" id="unIrFalta">${k.sin.length} sin registrar: ${esc(k.sin.slice(0, 2).map(d => d.nombre + " (" + d.circuito + ")").join(", "))}${k.sin.length > 2 ? "…" : ""} ›</button>` : `<div class="un-ok">Todo tiene resultado: podés enviar la rendición.</div>`}
+      <div class="un-sync">Habituales: ${rq ? rq + " pendiente(s) de sincronizar" : "al día"} · Queruclor: ${cola ? cola + " guardado(s) en el teléfono, falta sincronizar" : "al día"}${err ? " · ⚠️ " + esc(err) : ""}</div></div>`;
+    const ir = $("unIrFalta"); if (ir) ir.onclick = () => irA(k.sin[0]);
+  }
+  function irA(d) {
+    if (!d) return;
+    if (d.circuito === "Queruclor") { const q = QRR(); if (q) q.abrirCobro(d.ref.id); return; }
+    const s = app(); const i = s.peds.indexOf(d.ref);
+    const card = document.querySelector('[data-ri="' + i + '"]'); if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (typeof openModal === "function") openModal(i);
+  }
+  window.qrUnificadoRefrescar = pintarContador;
+
+  /* ── Rendición ─────────────────────────────────────────────────── */
+  function resumen() {
+    const s = app(); const q = QRR();
+    const r = { completas: 0, parciales: 0, rechazos: 0, cerrado: [], nollegue: [], sin: [], efectivo: 0, cheques: [], transf: [], vuelve: [], reprog: [] };
+    (s.peds || []).filter(p => !p.soloQueruclor).forEach(p => {
+      const st = resultadoML(p);
+      if (st === "todo") r.completas++; else if (st === "parte") r.parciales++; else if (st === "rechazo") r.rechazos++;
+      if (st === "visita") { (p.visita.motivo === "local_cerrado" ? r.cerrado : r.nollegue).push(p.nombre + " (Habituales)"); r.reprog.push(p.nombre + " · Habituales"); }
+      if (st === "sin") r.sin.push(p.nombre + " (Habituales)");
+      if (p.devolucion) r.vuelve.push(p.nombre + " · Habituales: " + (p.notasDevolucion || "sin detalle"));
+      [[p.formaPago1, p.importePagado1], [p.formaPago2, p.importePagado2]].forEach(([f, m]) => {
+        m = Number(m) || 0; if (!m || !f) return;
+        if (/fectivo/.test(f)) r.efectivo += m; else if (/heque/.test(f)) r.cheques.push({ cli: p.nombre, imp: m, c: "Habituales" }); else if (/ransfer/.test(f)) r.transf.push({ cli: p.nombre, imp: m, c: "Habituales" });
+      });
+    });
+    if (q) q.delRecorrido().forEach(e => {
+      const est = q.estadoDoc(e);
+      if (est === "pendiente" || est === "cola") { r.sin.push(nomQ(e) + " (Queruclor" + (est === "cola" ? ", sin sincronizar" : "") + ")"); return; }
+      if (est === "visita") { (e.ultima_visita.motivo === "local_cerrado" ? r.cerrado : r.nollegue).push(nomQ(e) + " (Queruclor)"); r.reprog.push(nomQ(e) + " · Queruclor " + e.remito + " · " + (e.bultos || 0) + " caja(s) siguen a tu cargo"); return; }
+      if (e.estado === "rechazado") { r.rechazos++; r.vuelve.push(nomQ(e) + " · Queruclor " + e.remito + ": todo"); }
+      else {
+        let parcial = false;
+        try { parcial = (QRSrv.get("qr_devoluciones", "remito=eq." + encodeURIComponent(e.remito), 0) || []).length > 0; } catch (x) {}
+        if (parcial) { r.parciales++; r.vuelve.push(nomQ(e) + " · Queruclor " + e.remito + ": una parte (devolución pendiente de nota)"); } else r.completas++;
+      }
+      const f = String(e.forma || "").toLowerCase(), m = Number(e.cobrado) || 0;
+      if (m) { if (f === "efectivo") r.efectivo += m; else if (f === "cheque") r.cheques.push({ cli: nomQ(e), imp: m, c: "Queruclor" }); else if (f === "transferencia") r.transf.push({ cli: nomQ(e), imp: m, c: "Queruclor" }); }
+    });
+    return r;
+  }
+  function modal(html, botones) {
+    let bg = $("unRendBg");
+    if (!bg) { bg = document.createElement("div"); bg.id = "unRendBg"; bg.className = "un-bg"; document.body.appendChild(bg); }
+    bg.innerHTML = `<div class="un-sheet" role="dialog" aria-modal="true">${html}<div class="un-btns">${botones}</div></div>`;
+    bg.classList.add("open");
+    bg.onclick = e => { if (e.target === bg) bg.classList.remove("open"); };
+    return bg;
+  }
+  const cerrarModal = () => { const b = $("unRendBg"); if (b) b.classList.remove("open"); };
+
+  async function sendRend() {
+    const s = app(); if (!s || s.lk) return;
+    const q = QRR();
+    if (q && q.leerCola().length) q.sincronizar();
+    const k = conteo();
+    if (k.sin.length) {
+      modal(`<h3>Falta registrar ${k.sin.length} entrega${k.sin.length === 1 ? "" : "s"}</h3>
+        <p>Cada documento del recorrido necesita un resultado: entregó todo, una parte, rechazó, o no se pudo entregar (Local cerrado / No llegué). Lo que ya cobraste se puede rendir apenas estén todos informados.</p>
+        <ul class="un-lista">${k.sin.slice(0, 10).map(d => `<li>${esc(d.nombre)} · ${d.circuito}</li>`).join("")}</ul>`,
+        `<button type="button" class="un-no" id="unCerrar">Volver</button><button type="button" class="un-si" id="unIr">Ir al primero</button>`);
+      $("unCerrar").onclick = cerrarModal; $("unIr").onclick = () => { cerrarModal(); irA(k.sin[0]); };
+      return;
+    }
+    if (q && q.leerCola().length) {
+      modal(`<h3>Falta sincronizar Queruclor</h3><p>${q.leerCola().length} registro(s) quedaron guardados en el teléfono y todavía no llegaron al sistema. Conectate y volvé a tocar «Rendición»: no se duplica nada.</p>`,
+        `<button type="button" class="un-si" id="unCerrar">Entendido</button>`);
+      $("unCerrar").onclick = cerrarModal; return;
+    }
+    /* Lo mismo que hacía la app antes de pedir confirmación: clientes que el
+       Admin agregó después y datos de Habituales sin sincronizar. */
+    try {
+      const sb = await fetch(SB_URL + "/rest/v1/reparto_en_curso?fecha=eq." + fAR() + "&turno=eq." + encodeURIComponent(s.turno) + "&select=pedidos",
+        { headers: { apikey: SB_ANON, Authorization: "Bearer " + SB_ANON }, signal: AbortSignal.timeout(3000) });
+      if (sb.ok) {
+        const d = await sb.json();
+        if (d.length && Array.isArray(d[0].pedidos)) {
+          const locales = new Set(s.peds.map(p => String(p.numeroCliente)));
+          const faltan = d[0].pedidos.filter(p => !locales.has(String(p.numeroCliente)));
+          if (faltan.length) { s.peds = [...s.peds, ...faltan]; cL(); render(); toast("⚠️ " + faltan.length + " cliente(s) nuevo(s) sin registrar. Completá y volvé a enviar.", 7000); return; }
+        }
+      }
+    } catch (e) {}
+    const rq = JSON.parse(localStorage.getItem("rq") || "[]"), pq = JSON.parse(localStorage.getItem("pq") || "[]");
+    if (rq.length || pq.length) {
+      if (!navigator.onLine) {
+        try { localStorage.setItem("rendicion_pending", JSON.stringify({ rep: s.rep, turno: s.turno, fecha: fAR() })); localStorage.setItem("backup_" + fAR() + "_" + s.turno, JSON.stringify(s.peds)); } catch (e) {}
+        toast("📴 Rendición de Habituales en cola: se envía sola cuando vuelva internet. Queruclor se rinde después.", 6000); return;
+      }
+      toast("⏳ Hay datos de Habituales sin sincronizar. Esperá un momento…"); if (typeof fR === "function") fR(); return;
+    }
+    const r = resumen();
+    const lista = (t, l) => l.length ? `<div class="un-fila"><span>${t}</span><b>${l.length}</b></div><div class="un-det">${l.map(esc).join("<br>")}</div>` : `<div class="un-fila"><span>${t}</span><b>0</b></div>`;
+    modal(`<h3>Rendición · turno ${esc(s.turno)} · ${esc(s.rep)}</h3>
+      <div class="un-sec">Entregas</div>
+      <div class="un-fila"><span>Entregadas completas</span><b>${r.completas}</b></div>
+      <div class="un-fila"><span>Entregadas en parte</span><b>${r.parciales}</b></div>
+      <div class="un-fila"><span>Rechazos</span><b>${r.rechazos}</b></div>
+      ${lista("Local cerrado", r.cerrado)}${lista("No llegué", r.nollegue)}
+      <div class="un-fila"><span>Sin registrar</span><b>${r.sin.length}</b></div>
+      <div class="un-sec">Dinero declarado</div>
+      <div class="un-fila"><span>Efectivo (lo cuenta Laura)</span><b>${pesos(r.efectivo)}</b></div>
+      <div class="un-fila"><span>Cheques (uno por uno)</span><b>${r.cheques.length}</b></div>
+      ${r.cheques.length ? `<div class="un-det">${r.cheques.map(c => esc(c.cli) + " · " + c.c + " · " + pesos(c.imp)).join("<br>")}</div>` : ""}
+      <div class="un-fila"><span>Transferencias declaradas (no suman al efectivo; las verifica Pablo en el banco)</span><b>${pesos(r.transf.reduce((a, x) => a + x.imp, 0))}</b></div>
+      ${r.transf.length ? `<div class="un-det">${r.transf.map(c => esc(c.cli) + " · " + c.c + " · " + pesos(c.imp)).join("<br>")}</div>` : ""}
+      <div class="un-sec">Mercadería y pendientes</div>
+      ${lista("Mercadería que vuelve", r.vuelve)}${lista("Entregas pendientes de reprogramar", r.reprog)}`,
+      `<button type="button" class="un-no" id="unCerrar">Volver</button><button type="button" class="un-si" id="unEnviar">Enviar rendición</button>`);
+    $("unCerrar").onclick = cerrarModal;
+    $("unEnviar").onclick = enviar;
+  }
+
+  let enviando = false;
+  async function enviar() {
+    if (enviando) return;                        // doble toque
+    enviando = true;
+    const b = $("unEnviar"); if (b) { b.disabled = true; b.textContent = "Enviando…"; }
+    const s = app();
+    const foto = { repartidor: s.rep, turno: s.turno, pedidos: s.peds.map(p => Object.assign({}, p)), recorrido: QRR() ? QRR().recorridoId() : null };
+    cerrarModal();
+    /* La rendición de Habituales sale por el camino de siempre (confirmación de la app). */
+    const si = $("cfmYes"); if (si) si.click();
+    /* Queruclor se rinde recién cuando Habituales quedó confirmada (la app bloquea el turno). */
+    const hasta = Date.now() + 90000;
+    while (Date.now() < hasta && !(app() && app().lk)) await new Promise(r => setTimeout(r, 400));
+    enviando = false;
+    if (!(app() && app().lk)) { toast("La rendición de Habituales no se confirmó todavía: Queruclor se rinde después, sin duplicar.", 7000); return; }
+    /* 18/10: las dos rendiciones del mismo envío quedan vinculadas por id (y por recorrido). */
+    if (window.RepartoML && foto.pedidos.length) { try { const ml = RepartoML.guardarRendicion(foto); foto.ml_ref = ml && ml.id; } catch (e) { console.warn("[ml]", e); } }
+    rendirQueruclor(foto);
+  }
+  function rendirQueruclor(foto) {
+    if (!window.Reparto) return;
+    try {
+      const rend = Reparto.rendir({ quien: foto.repartidor, repartidor: foto.repartidor, turno: foto.turno, recorrido: foto.recorrido, ml_ref: foto.ml_ref || null });
+      localStorage.removeItem("qr_rend_pendiente_v1");
+      if (rend && foto.ml_ref && window.RepartoML) { try { RepartoML.vincular(foto.ml_ref, rend.id); } catch (e) {} }
+      if (window.toast) toast(rend ? "Queruclor rendido: " + pesos(rend.total) + " declarados" : "Queruclor: nada cobrado para rendir (el recorrido quedó cerrado)", 5000);
+    } catch (e) {
+      try { localStorage.setItem("qr_rend_pendiente_v1", JSON.stringify(foto)); } catch (x) {}
+      if (window.toast) toast("📴 Queruclor no se rindió (sin conexión): se reintenta solo, sin duplicar.", 7000);
+    }
+  }
+  setInterval(() => { const p = localStorage.getItem("qr_rend_pendiente_v1"); if (p && navigator.onLine) { try { rendirQueruclor(JSON.parse(p)); } catch (e) {} } }, 20000);
+
+  /* El botón «Rendición» ya no depende de que todos estén «entregados»: se
+     habilita y, si falta algo, explica qué. */
+  function engancharRend() {
+    window.sendRend = sendRend;
+    const bt = $("bSn");
+    if (bt && !bt.dataset.un) {
+      bt.dataset.un = "1";
+      const clon = bt.cloneNode(true);
+      bt.parentNode.replaceChild(clon, bt);
+      clon.addEventListener("click", () => window.sendRend());
+    }
+    if (typeof window.uUI === "function" && !window.uUI.__un) {
+      const o = window.uUI;
+      window.uUI = function () { const r = o.apply(this, arguments); const s = app(); const b = $("bSn"); if (b && s) b.disabled = !!s.lk || !s.peds.length; try { pintarContador(); } catch (e) {} return r; };
+      window.uUI.__un = true;
+    }
+    /* El resumen de WhatsApp de siempre, con las visitas sin entrega. */
+    if (typeof window.buildResumen === "function" && !window.buildResumen.__un) {
+      const o = window.buildResumen;
+      window.buildResumen = function (pedidos) {
+        let t = o.apply(this, arguments);
+        const vis = (pedidos || []).filter(p => p.visita);
+        if (vis.length) t += "\n\n🚪 *No se pudo entregar (pendientes de reprogramar)*\n" + vis.map(p => "• " + p.nombre + " — " + (RES[p.visita.motivo] || "") + (p.visita.obs ? ": " + p.visita.obs : "")).join("\n");
+        return t;
+      };
+      window.buildResumen.__un = true;
+    }
+  }
+
+  const st = document.createElement("style");
+  st.textContent = `
+    #mlRes .un-k{ color:#0d7a4a; letter-spacing:.1em }
+    .un-res{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; margin-bottom:6px }
+    .un-res2{ margin-top:6px }
+    .un-b{ min-height:50px; padding:10px 6px; border:2px solid var(--bd,#dce0e8); background:var(--sf,#fff); border-radius:var(--rs,12px);
+      font:inherit; font-size:14px; font-weight:700; color:var(--tx,#1f2937); cursor:pointer }
+    .un-b.sel{ border-color:#0b2a5b; background:#eef5fd; color:#0b2a5b }
+    .un-b.dg.sel{ border-color:#b91c1c; background:#fef2f2; color:#991b1b }
+    .un-b:focus-visible, .un-si:focus-visible, .un-no:focus-visible, .un-falta:focus-visible{ outline:3px solid #2563eb; outline-offset:2px }
+    .un-obs{ width:100%; box-sizing:border-box; min-height:60px; margin-top:6px; padding:10px; border:1.5px solid var(--bd,#dce0e8); border-radius:10px; font:inherit }
+    .un-nota{ font-size:12.5px; color:var(--tx2,#4b5563); background:var(--sf2,#f5f6f8); border-radius:10px; padding:8px 10px; margin:6px 0; line-height:1.45 }
+    .un-demo{ margin:8px 12px 0; padding:9px 12px; border-radius:12px; background:#fef3c7; border:1px solid #fcd34d; color:#92400e; font-size:12.5px; font-weight:700; line-height:1.4 }
+    .un-vacio{ display:flex; flex-direction:column; gap:6px; margin:14px 12px 0; padding:14px 16px; border-radius:14px; background:#fff; border:1px solid #cbd5e1; color:#0f172a; text-align:left }
+    .un-vacio b{ font-size:16px } .un-vacio span{ font-size:13px; color:#475569; line-height:1.4 }
+    .un-vacio a{ align-self:flex-start; margin-top:4px; padding:10px 14px; border-radius:10px; background:#0e6b3e; color:#fff; font-weight:800; font-size:14px; text-decoration:none }
+    .un-cont{ margin:8px 12px 4px; padding:10px 12px; border-radius:12px; background:#eef5fd; border:1px solid #bcd6f3; font-size:13px; color:#0b2a5b; line-height:1.45 }
+    .un-falta{ display:block; width:100%; text-align:left; margin-top:6px; padding:9px 10px; border:0; border-radius:9px; background:#fef3c7; color:#78350f; font:inherit; font-weight:800; cursor:pointer }
+    .un-ok{ margin-top:4px; color:#0d7a4a; font-weight:800 }
+    .un-sync{ margin-top:5px; font-size:11.5px; color:#475569 }
+    .un-bg{ position:fixed; inset:0; z-index:100001; background:rgba(15,23,42,.55); display:none; align-items:flex-end; justify-content:center }
+    .un-bg.open{ display:flex }
+    .un-sheet{ background:#fff; width:100%; max-width:560px; max-height:92dvh; overflow-y:auto; border-radius:20px 20px 0 0; padding:18px 18px calc(18px + env(safe-area-inset-bottom)); box-sizing:border-box }
+    @media (min-width:700px){ .un-bg{ align-items:center } .un-sheet{ border-radius:18px } }
+    .un-sheet h3{ margin:0 0 8px; font-size:18px }
+    .un-sheet p{ font-size:14px; line-height:1.5; color:#334155 }
+    .un-sec{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#475569; margin:14px 0 4px }
+    .un-fila{ display:flex; justify-content:space-between; gap:12px; font-size:14px; padding:4px 0; border-bottom:1px solid #f1f5f9 }
+    .un-fila b{ white-space:nowrap; font-variant-numeric:tabular-nums }
+    .un-det{ font-size:12.5px; color:#475569; padding:2px 0 6px 8px; line-height:1.45 }
+    .un-lista{ font-size:14px; line-height:1.6; padding-left:20px }
+    .un-btns{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:14px }
+    .un-si, .un-no{ min-height:50px; border-radius:12px; font:inherit; font-size:15px; font-weight:800; cursor:pointer }
+    .un-si{ border:0; background:#0b2a5b; color:#fff } .un-si:disabled{ opacity:.6 }
+    .un-no{ border:2px solid #cbd5e1; background:#fff; color:#334155 }
+  `;
+  document.head.appendChild(st);
+
+  function enganchar() { engancharModal(); engancharRend(); try { pintarContador(); } catch (e) {} }
+  document.addEventListener("DOMContentLoaded", enganchar);
+  setTimeout(enganchar, 700);
+  setInterval(enganchar, 2500);
+  /* ── Lo que la oficina programa después (18/10/2026) ────────────────
+     En producción, lo cargado en «Carga de Reparto» llega al teléfono por
+     Firebase. En la prueba, el listener de la app pregunta cada 15 s por
+     la versión del reparto (unos bytes) y solo si cambió trae la lista.
+     Se combina con lo del teléfono: se suman clientes nuevos y se
+     actualizan importes de los que todavía no tienen resultado; nunca se
+     pisa una entrega, un pago o una visita ya registrados. */
+  const interactuado = p => !!(p.entregado || (Number(p.importePagado1) || 0) > 0 || (Number(p.importePagado2) || 0) > 0 || p.visita);
+  let escuchas = [], ultimaVersion = null, pollT = null;
+  function combinar(locales, servidor) {
+    const out = locales.map(p => Object.assign({}, p));
+    servidor.forEach(sp => {
+      const i = out.findIndex(p => soloNums(p.numeroCliente) === soloNums(sp.numeroCliente));
+      if (i < 0) { out.push(Object.assign({}, sp)); return; }
+      if (!interactuado(out[i])) ["importeTotal", "importeML", "queruclor", "pedidoId", "remito", "remitos", "soloQueruclor", "nombre", "domicilio", "localidad", "orden"]
+        .forEach(k => { if (sp[k] !== undefined) out[i][k] = sp[k]; });
+    });
+    return out.filter(p => servidor.some(sp => soloNums(sp.numeroCliente) === soloNums(p.numeroCliente)) || interactuado(p));
+  }
+  async function revisarProgramacion() {
+    const s = app(); if (!s || !s.turno || s.lk || window.__PROTO_DEMO || !window.__protoLocal || document.hidden) return;
+    try {
+      const v = await __protoLocal({ action: "version", fecha: __protoHoy(), turno: s.turno });
+      /* Punto de partida: la versión con la que el teléfono cargó la lista (si vino del servidor). */
+      if (ultimaVersion === null && window.__PROTO_VERSION != null) ultimaVersion = window.__PROTO_VERSION;
+      if (!v || v.version === ultimaVersion) return;
+      const primera = ultimaVersion === null; ultimaVersion = v.version;
+      if (primera) return;
+      const d = await __protoLocal({ action: "cargarReparto", fecha: __protoHoy(), turno: s.turno });
+      if (!d || !d.programado || s.sav) { ultimaVersion = null; return; }
+      const nuevos = combinar(s.peds || [], d.pedidos.map(p => Object.assign({}, p, { importeTotal: p.importeTotal != null ? p.importeTotal : p.importeML })));
+      const obj = {}; nuevos.forEach(p => { obj[p.numeroCliente] = p; });
+      escuchas.forEach(cb => { try { cb({ val: () => obj }); } catch (e) {} });
+      if (window.QRReparto) QRReparto.refrescar();
+      if (window.toast) toast("📦 La oficina actualizó el reparto", 3500);
+    } catch (e) { /* sin señal: se vuelve a preguntar */ }
+  }
+  window.__protoEscuchar = cb => { escuchas.push(cb); if (!pollT) pollT = setInterval(revisarProgramacion, 15000); };
+  window.qrRevisarProgramacion = revisarProgramacion;
+  /* Al volver la señal, las novedades de la oficina llegan sin esperar el próximo ciclo
+     (lo registrado sin señal se conserva: combinar() no pisa lo interactuado). 20/10/2026. */
+  window.addEventListener("online", () => setTimeout(revisarProgramacion, 800));
+  /* Aviso fijo cuando se pidió la lista de demostración (?demo=1). */
+  setInterval(() => {
+    const c = $("unCont");
+    let a = $("unDemo");
+    if (c && window.__PROTO_DEMO && !a) { a = document.createElement("div"); a.id = "unDemo"; a.className = "un-demo";
+      a.textContent = "Lista de DEMOSTRACIÓN (abierta con ?demo=1): no es un reparto real ni se programó en «Carga de Reparto».";
+      c.parentNode.insertBefore(a, c); }
+    if (!window.__PROTO_DEMO && a) a.remove();
+    /* Sin turno programado: lo dice y lleva a programarlo (19/10/2026). */
+    const ts = $("turnoScreen"), bm = $("turnoM"), bt = $("turnoT");
+    let v = $("unVacio");
+    const vacio = ts && ts.classList.contains("show") && bm && bt && bm.disabled && bt.disabled &&
+      /Sin reparto/.test(($("tMS") || {}).textContent || "") && /Sin reparto/.test(($("tTS") || {}).textContent || "");
+    if (vacio && !v) {
+      v = document.createElement("div"); v.id = "unVacio"; v.className = "un-vacio";
+      v.innerHTML = "<b>No hay entregas programadas</b><span>Ningún turno de hoy tiene entregas cargadas. Se programan en «Carga de Reparto».</span>" +
+        "<a href=\"carga-reparto.html\" target=\"_blank\" rel=\"noopener\">Abrir Carga de Reparto</a>";
+      bt.parentNode.insertBefore(v, bt.nextSibling);
+    }
+    if (!vacio && v) v.remove();
+    /* Turno abierto pero sin ningún cliente (por ejemplo, lo vaciaron en la oficina). */
+    const s = app();
+    let e = $("unVacioLista");
+    const sinLista = c && s && s.turno && !window.__PROTO_DEMO && Array.isArray(s.peds) && !s.peds.length;
+    if (sinLista && !e) { e = document.createElement("div"); e.id = "unVacioLista"; e.className = "un-vacio";
+      e.innerHTML = "<b>No hay entregas programadas</b><span>Este turno no tiene clientes cargados.</span><a href=\"carga-reparto.html\" target=\"_blank\" rel=\"noopener\">Abrir Carga de Reparto</a>";
+      c.parentNode.insertBefore(e, c); }
+    if (!sinLista && e) e.remove();
+  }, 1000);
+
+  window.QRUnificado = { conteo, resumen, sendRend, documentos, combinar };
+})();
+
 </script>
 </body></html>

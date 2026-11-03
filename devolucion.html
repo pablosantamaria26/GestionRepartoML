@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<script>window.QR_PROD_API="https://queruclor-api.santamariapablodaniel.workers.dev";window.QR_API_BASE="https://queruclor-api.santamariapablodaniel.workers.dev";window.QR_PUESTO="reparto";window.QR_URL_REGISTRO="https://frosty-term-20ea.santamariapablodaniel.workers.dev/";window.QR_FOTOS_BASE="https://gjeyvbidomxzofcdycya.supabase.co/storage/v1/object/public/qr-fotos/";</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   CONEXIÓN AL SERVIDOR COMPARTIDO DE PRUEBAS — va PRIMERO en cada pantalla
+
+   Hace que las siete pantallas trabajen sobre LOS MISMOS datos (los del
+   servidor local, prototipo/servidor-compartido.js) sin tocar su código:
+
+   1. Lo que iba a Supabase (/rest/v1/…) va al servidor local, igual formato.
+   2. El pedido que iba al Worker va a /local/pedido (que guarda el pedido y
+      reserva el stock de Queruclor). Google Forms se contesta acá.
+      Cualquier otra escritura hacia afuera se frena: nada sale a producción.
+   3. El «tiempo real» de depósito y facturación se imita consultando los
+      cambios del servidor cada 1,5 s.
+   4. Unas pocas claves que tienen que verse entre pantallas (rendición de
+      habituales, sello de despacho, datos de la empresa, configuración de
+      precios…) se guardan en el servidor en vez de en el navegador.
+   5. QRSrv: llamadas a las funciones de la base para los módulos de
+      Queruclor (stock, cuentas, remitos…).
+
+   Si el servidor no responde, aparece arriba un aviso rojo y las
+   operaciones que no se pudieron guardar dan error (no se fingen hechas).
+
+   6. GENERACIÓN DEL ENTORNO (29/10/2026): cada escritura lleva la
+      generación que esta pantalla conoce (cabecera X-QR-Gen) y el servidor
+      rechaza la de otra. Al abrir, si el equipo guardaba colas de otra
+      generación (pedidos sin enviar, recibos, rendiciones, lecturas del
+      armado…), se APARTAN sin enviarlas ni borrarlas, con aviso. Recargar
+      no basta para limpiar una cola: por eso se aparta acá, explícito.
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  "use strict";
+  if (window.QR_LOCAL) return;
+  window.QR_LOCAL = true;
+  /* En producción (build-produccion.js) lo mismo va al Worker queruclor-api, con el token del puesto. */
+  var PROD = !!window.QR_PROD_API;
+  var ORIGEN = PROD ? window.QR_PROD_API : location.origin;
+  var CADA = PROD ? 10000 : 1500;
+  /* Una pestaña del contenedor Cartera/Pedidos sigue abierta en un iframe sin mostrarse, y
+     document.hidden no se entera: tampoco cuenta como visible. */
+  function oculta() {
+    if (document.hidden) return true;
+    try { var f = window.frameElement; return !!(f && f.getClientRects().length === 0); } catch (e) { return false; }
+  }
+  window.qrOculta = oculta;
+  if (PROD) window.qrFotoUrl = function (e) { return window.QR_FOTOS_BASE + e + ".jpg"; };
+  var CLAVE_TOKEN = window.QR_PUESTO === "admin" ? "qr_admin_token_v1" : "qr_token_puesto_v1";
+  var yaPregunto = false;
+  function tokenPuesto() {
+    if (!PROD || window.QR_PUESTO === "vendedor") return null;
+    var t = null; try { t = localStorage.getItem(CLAVE_TOKEN); } catch (e) {}
+    /* El enlace de instalación del puesto lo trae en #puesto=…: no viaja al servidor y se saca de la barra. */
+    var m = t ? null : /[#&]puesto=([^&]+)/.exec(location.hash);
+    if (m) {
+      t = decodeURIComponent(m[1]);
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    } else if (!t && !yaPregunto) {
+      /* Una sola vez por apertura: si se cancela, la app sigue andando con lo que no pide token. */
+      yaPregunto = true;
+      t = (window.prompt("Token de este puesto (" + window.QR_PUESTO + "). Se pide una sola vez en este equipo:") || "").trim();
+    }
+    if (t) try { localStorage.setItem(CLAVE_TOKEN, t); } catch (e) {}
+    return t || null;
+  }
+  function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; return h; }
+  function vigilarToken(status) { if (PROD && status === 401) { yaPregunto = false; try { localStorage.removeItem(CLAVE_TOKEN); } catch (e) {} } }
+  var _fetch = window.fetch.bind(window);
+  var GEN = null;
+
+  /* ── Aviso de conexión ─────────────────────────────────────────── */
+  var caido = false, aviso = null;
+  function pintarAviso() {
+    if (!document.body) return;
+    if (caido && !aviso) {
+      aviso = document.createElement("div");
+      aviso.id = "qrAvisoServidor";
+      aviso.setAttribute("role", "alert");
+      aviso.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:2147483647;background:#b91c1c;color:#fff;" +
+        "font:700 14px/1.35 system-ui,sans-serif;padding:10px 14px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.3)";
+      aviso.textContent = "⚠️ Sin conexión con el servidor. Lo que hagas ahora NO se guarda (los pedidos del vendedor quedan en su cola y salen solos al volver). Revisá que la ventana del servidor siga abierta.";
+      document.body.appendChild(aviso);
+    } else if (!caido && aviso) { aviso.remove(); aviso = null; }
+  }
+  function marcar(estado) { if (caido !== estado) { caido = estado; pintarAviso(); } }
+  function ping() {
+    /* En producción: oculta no consulta, y si la pantalla ya pregunta por cambios, eso mismo dice si hay conexión. */
+    if (PROD && (oculta() || (oyentesCambios && oyentesCambios.length))) return;
+    _fetch(ORIGEN + "/local/salud", { cache: "no-store" }).then(function (r) {
+      marcar(!r.ok);
+      return r.ok ? r.json().then(function (j) {
+        if (j && j.generacion && GEN && j.generacion !== GEN) avisoGeneracion();
+        else if (j && j.generacion && !GEN) revisarGeneracion(j.generacion);
+      }) : null;
+    }).catch(function () { marcar(true); });
+  }
+  setInterval(ping, PROD ? 30000 : 4000);
+  document.addEventListener("DOMContentLoaded", function () { pintarAviso(); ping(); });
+
+  /* ── Llamadas síncronas al servidor (módulos de Queruclor) ────────
+     Los módulos de Queruclor tienen una interfaz síncrona (Stock.disponible,
+     Cuentas.saldo…). Con el servidor en la misma PC o el mismo Wi-Fi la
+     respuesta tarda milisegundos, así que se llama de forma síncrona y las
+     pantallas no cambian. */
+  function xhr(metodo, url, cuerpo) {
+    var x = new XMLHttpRequest();
+    try {
+      x.open(metodo, ORIGEN + url, false);
+      x.setRequestHeader("Content-Type", "application/json");
+      if (GEN) x.setRequestHeader("X-QR-Gen", GEN);
+      var h0 = conToken({}); for (var k0 in h0) x.setRequestHeader(k0, h0[k0]);
+      x.send(cuerpo === undefined ? null : JSON.stringify(cuerpo));
+    } catch (e) {
+      marcar(true);
+      throw new Error("Sin conexión con el servidor: no se guardó.");
+    }
+    vigilarToken(x.status);
+    if (x.status === 0 || x.status >= 500) { marcar(true); throw new Error("El servidor no respondió (" + x.status + "): no se guardó."); }
+    marcar(false);
+    var datos = null;
+    try { datos = x.responseText ? JSON.parse(x.responseText) : null; } catch (e) {}
+    if (x.status === 409 && datos && datos.generacion_vieja) avisoGeneracion();
+    if (x.status >= 400) throw new Error((datos && (datos.message || datos.error)) || ("error " + x.status));
+    return datos;
+  }
+  var cache = {};
+  window.QRSrv = {
+    rpc: function (fn, args) { var r = xhr("POST", "/rest/v1/rpc/" + fn, args || {}); cache = {}; return r; },
+    /* Lecturas con memoria corta: una pantalla pregunta el stock de cada
+       tarjeta varias veces por dibujo; con esto es una sola consulta. */
+    get: function (tabla, qs, ttl) {
+      var k = tabla + "?" + (qs || ""), ahora = Date.now();
+      if (cache[k] && ahora - cache[k].t < (ttl == null ? 1500 : ttl)) return cache[k].v;
+      var v = xhr("GET", "/rest/v1/" + tabla + (qs ? "?" + qs : ""));
+      cache[k] = { t: ahora, v: v };
+      return v;
+    },
+    olvidar: function () { cache = {}; },
+    generacion: function () { return GEN; },
+    caido: function () { return caido; },
+    /* Aviso de cambios para las pantallas que no usan el cliente de
+       Supabase (admin, vendedor). En producción es un canal de Realtime;
+       acá lee el mismo registro que reparte el «tiempo real» local, y
+       solo con la pestaña a la vista. fn(tablasQueCambiaron). */
+    escuchar: function (tablas, fn) { oyentesCambios.push({ tablas: tablas, fn: fn }); arrancarCambios(); },
+  };
+  var oyentesCambios = [], desdeCambios = -1, timerCambios = null;
+  function arrancarCambios() {
+    if (timerCambios) return;
+    timerCambios = setTimeout(function tick() {
+      if (oculta()) { timerCambios = setTimeout(tick, CADA); return; }
+      _fetch(ORIGEN + "/local/cambios?desde=" + desdeCambios, { cache: "no-store", headers: conToken({}) }).then(function (r) { return r.json(); }).then(function (j) {
+        marcar(false);
+        if (desdeCambios >= 0 && j.cambios && j.cambios.length) {
+          var hubo = {};
+          j.cambios.forEach(function (c) { hubo[c.tabla] = true; });
+          cache = {};
+          oyentesCambios.forEach(function (o) {
+            var t = o.tablas.filter(function (x) { return hubo[x]; });
+            if (t.length) try { o.fn(t); } catch (e) { console.warn("[cambios]", e); }
+          });
+        }
+        desdeCambios = j.ultimo;
+      }).catch(function () { marcar(true); }).then(function () { timerCambios = setTimeout(tick, CADA); });
+    }, 50);
+  }
+
+  /* ── Claves compartidas entre pantallas ─────────────────────────── */
+  var COMPARTIDAS = /^(qr_rend_ml_v1|qr_despacho_v1|qr_empresa_v1|qr_logo_v1|qr_papelera_v1|qr_pin_ajustes_v1|qr_precio_config_v1|qr_margen_rubros_v1|qr_historial_precios_v1|qr_compras_cfg_v1|qr_demanda_v1|qr_demanda_rubros_v1|qr_demanda_crit_v1|qr_etq_impresas_v1|etiquetas_total_impresa_v1|etiquetas_habituales_v1|etiquetas_cabos_v1)$/;
+  var S = Storage.prototype, g0 = S.getItem, s0 = S.setItem, r0 = S.removeItem;
+  var kvCache = {};
+  S.getItem = function (k) {
+    if (this !== window.localStorage || !COMPARTIDAS.test(k)) return g0.call(this, k);
+    var c = kvCache[k];
+    if (c && Date.now() - c.t < 800) return c.v;
+    try { var v = xhr("GET", "/local/kv/" + k).valor; kvCache[k] = { t: Date.now(), v: v }; return v; }
+    catch (e) { return c ? c.v : null; }
+  };
+  S.setItem = function (k, v) {
+    if (this !== window.localStorage || !COMPARTIDAS.test(k)) return s0.call(this, k, v);
+    var x = new XMLHttpRequest();
+    x.open("PUT", ORIGEN + "/local/kv/" + k, false);
+    if (GEN) x.setRequestHeader("X-QR-Gen", GEN);
+    var hk = conToken({}); for (var kk in hk) x.setRequestHeader(kk, hk[kk]);
+    try { x.send(String(v)); } catch (e) { marcar(true); throw new Error("Sin conexión con el servidor: no se guardó."); }
+    if (x.status === 409) { avisoGeneracion(); throw new Error("Esta pantalla es de antes de renovar el entorno: no se guardó. Recargala."); }
+    if (x.status !== 200) { marcar(true); throw new Error("El servidor no guardó " + k); }
+    kvCache[k] = { t: Date.now(), v: String(v) };
+  };
+  S.removeItem = function (k) {
+    if (this !== window.localStorage || !COMPARTIDAS.test(k)) return r0.call(this, k);
+    xhr("DELETE", "/local/kv/" + k); delete kvCache[k];
+  };
+
+  /* ── fetch: Supabase, Worker y Forms van al servidor local ──────── */
+  function esPedido(cuerpo) { return cuerpo && (cuerpo.fechaEntrega || cuerpo.numeroCliente) && cuerpo.productos !== undefined; }
+  window.fetch = function (input, opts) {
+    var url = String((input && input.url) || input || "");
+    var metodo = String((opts && opts.method) || (input && input.method) || "GET").toUpperCase();
+    if (PROD) {
+      /* Lo de Queruclor va al Worker con el token del puesto; un pedido con Queruclor también.
+         Lo demás (Supabase de las apps actuales, Forms, otros Workers) sigue yendo adonde iba. */
+      var propio = /^\/(local|api|rest)\//.test(url) ? ORIGEN + url : (url.indexOf(ORIGEN) === 0 ? url : null);
+      if (propio) {
+        var o = Object.assign({}, opts || {}), hs = {};
+        if (o.headers && typeof o.headers.forEach === "function") o.headers.forEach(function (v, k) { hs[k] = v; }); else Object.assign(hs, o.headers || {});
+        o.headers = conToken(hs);
+        return _fetch(propio, o).then(function (r) { vigilarToken(r.status); marcar(r.status >= 500); return r; }, function (e) { marcar(true); throw e; });
+      }
+      if (/frosty-term/.test(url) && metodo === "POST") {
+        var cp = null; try { cp = JSON.parse((opts && opts.body) || "null"); } catch (e) {}
+        if (esPedido(cp) && /—\s*QUERUCLOR/iu.test(String(cp.productos))) return enviarPedido(opts);
+      }
+      return _fetch(input, opts);
+    }
+    var m = /^https:\/\/[a-z0-9]+\.supabase\.co(\/rest\/v1\/.*)$/.exec(url);
+    if (m) return _fetch(ORIGEN + m[1], conGen(opts)).then(function (r) { marcar(false); vigilar(r); return r; }, function (e) { marcar(true); throw e; });
+
+    if (/workers\.dev/.test(url) && metodo === "POST") {
+      var cuerpo = null; try { cuerpo = JSON.parse((opts && opts.body) || "null"); } catch (e) {}
+      if (esPedido(cuerpo)) return enviarPedido(opts);
+      return Promise.resolve(new Response('{"status":"ok","prueba":true}', { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    if (/docs\.google\.com\/forms/.test(url)) return _fetch(ORIGEN + "/local/forms", conGen({ method: "POST", body: "{}" })).catch(function (e) { marcar(true); throw e; });
+
+    /* Nada más sale hacia afuera escribiendo: ni Apps Script, ni otros Workers. */
+    if (metodo !== "GET" && metodo !== "HEAD" && /^https?:\/\//.test(url) && url.indexOf(ORIGEN) !== 0) {
+      return Promise.resolve(new Response('{"status":"ok","success":true,"ok":true,"prueba":true}', { status: 200, headers: { "Content-Type": "application/json" } }));
+    }
+    /* Lo que va al mismo servidor también lleva la generación. */
+    if (metodo !== "GET" && metodo !== "HEAD" && (url.indexOf(ORIGEN) === 0 || /^\/(?!\/)/.test(url))) {
+      if (input && typeof input !== "string" && input.headers && GEN) { try { input.headers.set("X-QR-Gen", GEN); } catch (e) {} }
+      return _fetch(input, conGen(opts)).then(function (r) { vigilar(r); return r; });
+    }
+    return _fetch(input, opts);
+  };
+  function enviarPedido(opts) {
+    return _fetch(ORIGEN + "/local/pedido", conGen({ method: "POST", headers: { "Content-Type": "application/json" }, body: opts.body }))
+      .then(function (r) {
+        marcar(false);
+        return r.clone().json().then(function (j) {
+          /* El stock se reservó al LLEGAR el pedido. Si faltó algo, se le
+             avisa al vendedor como antes. */
+          if (j && j.reserva && j.reserva.faltantes && j.reserva.faltantes.length && window.qrAvisarFaltantes) {
+            try { window.qrAvisarFaltantes(j.reserva); } catch (e) {}
+          }
+          /* Un artículo pausado que llegó igual (pedido cargado antes de
+             la pausa, guardado sin señal) no se vende: queda como faltante. */
+          var pz = j && j.validacion && j.validacion.pausados;
+          if (pz && pz.length && window.showToast) {
+            try { window.showToast("No se vendió (artículo pausado): " + pz.map(function (x) { return x.nombre || x.ean; }).join(", "), "error"); } catch (e) {}
+          }
+          return r;
+        }, function () { return r; });
+      }, function (e) { marcar(true); throw e; });
+  }
+  function conGen(opts) {
+    if (!GEN) return opts;
+    var o = Object.assign({}, opts || {});
+    var h = o.headers;
+    if (h && typeof h.set === "function") { h = new Headers(h); h.set("X-QR-Gen", GEN); }
+    else h = Object.assign({}, h || {}, { "X-QR-Gen": GEN });
+    o.headers = h;
+    return o;
+  }
+  function vigilar(r) { try { if (r && r.status === 409 && r.headers.get("X-QR-Generacion-Vieja")) avisoGeneracion(); } catch (e) {} }
+
+  /* ── Generación del entorno y colas viejas ───────────────────────── */
+  var GEN_KEY = "qr_entorno_gen_v1";
+  var COLAS = ["pedidosPendientes", "qr_recibos_pendientes_v1", "qr_reparto_cola_v1", "qr_rend_pendiente_v1", "rendicion_pending", "qr_prep_cola_v1"];
+  var vacia = function (v) { return v == null || v === "" || v === "[]" || v === "{}" || v === "null"; };
+  var avisoGen = null, avisoApartadas = null;
+  function avisoGeneracion() {
+    if (avisoGen || !document.body) return;
+    avisoGen = document.createElement("div");
+    avisoGen.id = "qrAvisoGeneracion"; avisoGen.setAttribute("role", "alert");
+    avisoGen.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:2147483647;background:#7c2d12;color:#fff;font:700 14px/1.35 system-ui,sans-serif;padding:10px 14px;text-align:center";
+    avisoGen.innerHTML = "⚠️ Esta pantalla es de antes de que se renovara el entorno de prueba: lo que hagas no se guarda. " +
+      "<button type=\"button\" style=\"margin-left:8px;font:inherit;padding:4px 10px;border-radius:8px;border:0;cursor:pointer\" onclick=\"location.reload()\">Recargar</button>";
+    document.body.appendChild(avisoGen);
+  }
+  function revisarGeneracion(gen) {
+    var ls = window.localStorage, antes = null, apartadas = [];
+    try { antes = g0.call(ls, GEN_KEY); } catch (e) { return; }
+    if (antes !== gen) {
+      COLAS.forEach(function (k) {
+        var v = null; try { v = g0.call(ls, k); } catch (e) {}
+        if (vacia(v)) return;
+        try { s0.call(ls, "qr_apartado|" + (antes || "sin-generacion") + "|" + k, JSON.stringify({ valor: v, apartado: new Date().toISOString(), generacion_nueva: gen })); r0.call(ls, k); apartadas.push(k); } catch (e) {}
+      });
+      try { s0.call(ls, GEN_KEY, gen); } catch (e) {}
+    }
+    GEN = gen;
+    if (apartadas.length) {
+      window.QR_APARTADAS = apartadas;
+      var pintar = function () {
+        if (avisoApartadas || !document.body) return;
+        avisoApartadas = document.createElement("div");
+        avisoApartadas.id = "qrAvisoApartadas"; avisoApartadas.setAttribute("role", "status");
+        avisoApartadas.style.cssText = "position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483646;background:#fef3c7;color:#78350f;border:2px solid #f59e0b;border-radius:12px;font:600 13.5px/1.4 system-ui,sans-serif;padding:10px 14px";
+        avisoApartadas.innerHTML = "Este equipo tenía operaciones guardadas sin enviar de antes de renovar el entorno (" + apartadas.length + "). <b>No se enviaron</b>: quedaron apartadas en el equipo. " +
+          "<button type=\"button\" style=\"margin-left:6px;font:inherit;padding:3px 10px;border-radius:8px;border:1px solid #b45309;background:#fff;cursor:pointer\" onclick=\"this.parentNode.remove()\">Entendido</button>";
+        document.body.appendChild(avisoApartadas);
+      };
+      if (document.body) pintar(); else document.addEventListener("DOMContentLoaded", pintar);
+    }
+  }
+
+  /* ── Sin service workers en el sistema de prueba ──────────────────
+     Guardarían copias de las páginas y, al rearmarlas, se seguiría viendo
+     la versión vieja. Se contesta un registro de mentira para que las
+     pantallas que lo esperan no fallen. */
+  if (navigator.serviceWorker && !PROD) {
+    try {
+      var regFalso = { scope: location.href, installing: null, waiting: null, active: null,
+        update: function () { return Promise.resolve(); }, unregister: function () { return Promise.resolve(true); },
+        addEventListener: function () {}, removeEventListener: function () {} };
+      navigator.serviceWorker.register = function () { return Promise.resolve(regFalso); };
+      if (navigator.serviceWorker.getRegistrations) navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.unregister(); }); });
+    } catch (e) {}
+  }
+
+  /* ── Tiempo real de Supabase, imitado ───────────────────────────── */
+  var WS0 = window.WebSocket;
+  function RealtimeLocal(url) {
+    var ws = this, desde = -1, timer = null, cerrado = false;
+    ws.url = url; ws.readyState = 0; ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    var oyentes = { open: [], message: [], close: [], error: [] };
+    ws.addEventListener = function (t, f) { (oyentes[t] = oyentes[t] || []).push(f); };
+    ws.removeEventListener = function (t, f) { oyentes[t] = (oyentes[t] || []).filter(function (x) { return x !== f; }); };
+    function emitir(t, ev) { if (typeof ws["on" + t] === "function") ws["on" + t](ev); (oyentes[t] || []).forEach(function (f) { f(ev); }); }
+    ws.send = function () {};
+    ws.close = function () { cerrado = true; clearTimeout(timer); ws.readyState = 3; };
+    function tick() {
+      if (cerrado) return;
+      _fetch(ORIGEN + "/local/cambios?desde=" + desde, { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (j) {
+        if (desde >= 0) (j.cambios || []).forEach(function (c) {
+          emitir("message", { data: JSON.stringify({ topic: "realtime:public:" + c.tabla, event: "postgres_changes",
+            payload: { data: { table: c.tabla, type: c.tipo, record: c.fila, old_record: c.fila, schema: "public" } } }) });
+        });
+        desde = j.ultimo;
+      }).catch(function () {}).then(function () { timer = setTimeout(tick, 1500); });
+    }
+    setTimeout(function () { ws.readyState = 1; emitir("open", {}); tick(); }, 30);
+  }
+  if (!PROD) {
+    window.WebSocket = function (url, p) {
+      if (/supabase\.co/.test(String(url))) return new RealtimeLocal(url);
+      return p === undefined ? new WS0(url) : new WS0(url, p);
+    };
+    window.WebSocket.prototype = WS0.prototype;
+    ["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach(function (k, i) { window.WebSocket[k] = i; });
+  }
+
+  /* Generación: se pregunta al abrir (al final de este archivo, que va
+     PRIMERO en la página), ANTES de que cualquier cola intente salir. */
+  (function () {
+    if (PROD) return;
+    try {
+      var x = new XMLHttpRequest();
+      x.open("GET", ORIGEN + "/local/salud", false); x.send(null);
+      var j = x.status === 200 ? JSON.parse(x.responseText) : null;
+      if (j && j.generacion) revisarGeneracion(j.generacion);
+    } catch (e) {}
+  })();
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e6b3e">
+<title>Devoluciones Queruclor</title>
+<style>
+  :root{
+    --verde:#0e6b3e; --verde-2:#e8f5ee; --tinta:#0f172a; --gris:#64748b; --linea:#e2e8f0;
+    --fondo:#f1f5f2; --blanco:#fff; --rojo:#b42318; --rojo-2:#fef3f2; --ambar:#b45309; --ambar-2:#fffaeb;
+  }
+  *{ box-sizing:border-box; -webkit-tap-highlight-color:transparent }
+  body{ margin:0; background:var(--fondo); color:var(--tinta); min-height:100vh;
+    font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding-bottom:40px }
+  header{ background:var(--verde); color:#fff; padding:14px 16px calc(12px); position:sticky; top:0; z-index:5 }
+  header h1{ margin:0; font-size:19px; font-weight:800 }
+  header p{ margin:2px 0 0; font-size:12.5px; opacity:.85 }
+  main{ max-width:560px; margin:0 auto; padding:14px 16px; display:flex; flex-direction:column; gap:14px }
+  .tarjeta{ background:var(--blanco); border-radius:14px; padding:14px; box-shadow:0 1px 3px rgba(15,23,42,.08) }
+  .etq{ font-size:11px; font-weight:800; letter-spacing:.07em; text-transform:uppercase; color:var(--gris); margin:0 0 8px }
+  button{ font:inherit; cursor:pointer }
+  .btn{ width:100%; border:0; border-radius:12px; padding:15px; font-weight:800; font-size:16px;
+    background:var(--verde); color:#fff }
+  .btn:disabled{ opacity:.45 }
+  .btn.suave{ background:var(--verde-2); color:var(--verde) }
+  .btn.gris{ background:#eef2f6; color:var(--tinta) }
+  .quienes{ display:flex; gap:8px }
+  .quien{ flex:1; padding:12px; border:2px solid var(--linea); background:#fff; border-radius:11px; font-weight:800; color:var(--gris) }
+  .quien.on{ border-color:var(--verde); background:var(--verde-2); color:var(--verde) }
+  .manual{ display:flex; gap:8px; margin-top:10px }
+  .manual input{ flex:1; min-width:0; padding:13px; border:2px solid var(--linea); border-radius:11px; font:inherit; text-transform:uppercase }
+  .manual button{ padding:0 16px; border:0; border-radius:11px; background:var(--tinta); color:#fff; font-weight:800 }
+  video{ width:100%; border-radius:12px; background:#000; margin-top:10px; max-height:46vh; object-fit:cover }
+  .msg{ padding:11px 13px; border-radius:11px; font-size:14px; margin-top:10px }
+  .msg.err{ background:var(--rojo-2); color:var(--rojo) }
+  .msg.aviso{ background:var(--ambar-2); color:var(--ambar) }
+  .msg.ok{ background:var(--verde-2); color:var(--verde); font-weight:700 }
+  .cli{ font-size:19px; font-weight:800; margin:0 }
+  .sub{ font-size:13px; color:var(--gris); margin-top:2px }
+  .fila{ padding:12px 0; border-top:1px solid var(--linea) }
+  .fila:first-of-type{ border-top:0 }
+  .fila.sin{ opacity:.45 }
+  .art{ font-weight:700; font-size:15px }
+  .det{ font-size:12.5px; color:var(--gris); margin-top:1px }
+  .ctl{ display:flex; align-items:center; gap:10px; margin-top:9px }
+  .paso{ width:46px; height:46px; border-radius:12px; border:2px solid var(--linea); background:#fff; font-size:24px; font-weight:800; color:var(--tinta) }
+  .paso:active{ background:var(--verde-2) }
+  .n{ min-width:34px; text-align:center; font-size:24px; font-weight:800; font-variant-numeric:tabular-nums }
+  .estado{ margin-left:auto; display:flex; gap:6px }
+  .est{ padding:9px 11px; border:2px solid var(--linea); background:#fff; border-radius:10px; font-size:13px; font-weight:700; color:var(--gris) }
+  .est.on.sana{ border-color:var(--verde); background:var(--verde-2); color:var(--verde) }
+  .est.on.rota{ border-color:var(--ambar); background:var(--ambar-2); color:var(--ambar) }
+  .hist{ display:flex; justify-content:space-between; gap:10px; padding:10px 0; border-top:1px solid var(--linea); font-size:14px }
+  .hist:first-of-type{ border-top:0 }
+  .chip{ font-size:11.5px; font-weight:800; padding:3px 9px; border-radius:99px; white-space:nowrap; align-self:flex-start }
+  .chip.p{ background:var(--ambar-2); color:var(--ambar) }
+  .chip.a{ background:var(--verde-2); color:var(--verde) }
+  .vacio{ color:var(--gris); font-size:14px }
+  .oculto{ display:none !important }
+  @media (prefers-color-scheme: dark){
+    :root{ --fondo:#0b1210; --blanco:#16211c; --tinta:#e8efe9; --gris:#93a39a; --linea:#26352d; --verde-2:#153426; --rojo-2:#3a1613; --ambar-2:#33260c }
+    .quien,.est,.paso{ background:#16211c } .btn.gris{ background:#22302a } .manual button{ background:#e8efe9; color:#0b1210 }
+    .msg.err{ color:#fda29b } .msg.aviso,.chip.p,.est.on.rota{ color:#fbbf6a } .btn.suave,.quien.on,.est.on.sana,.chip.a,.msg.ok{ color:#6ee7a4 }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>↩️ Devoluciones Queruclor</h1>
+  <p>Escaneá la etiqueta de la caja que volvió</p>
+</header>
+
+<main>
+
+  <section class="tarjeta">
+    <p class="etq">¿Quién está devolviendo?</p>
+    <div class="quienes" id="quienes"></div>
+  </section>
+
+  <section class="tarjeta" id="secEscaneo">
+    <p class="etq">1 · Escanear la etiqueta</p>
+    <button class="btn" id="btnCam">📷 Prender la cámara</button>
+    <video id="video" class="oculto" playsinline muted></video>
+    <div class="manual">
+      <input id="codigo" placeholder="o escribí el código: ML-…" autocomplete="off" autocapitalize="characters" inputmode="text">
+      <button id="btnBuscar">Buscar</button>
+    </div>
+    <div id="msgEscaneo"></div>
+  </section>
+
+  <section class="tarjeta oculto" id="secPedido">
+    <p class="etq">2 · ¿Qué volvió?</p>
+    <p class="cli" id="pCliente"></p>
+    <div class="sub" id="pRemito"></div>
+    <div id="filas" style="margin-top:8px"></div>
+    <div id="msgPedido"></div>
+    <button class="btn" id="btnRegistrar" style="margin-top:12px">Registrar devolución</button>
+    <button class="btn gris" id="btnOtra" style="margin-top:8px">Cancelar</button>
+  </section>
+
+  <section class="tarjeta">
+    <p class="etq">Últimas devoluciones</p>
+    <div id="historial" class="vacio">Cargando…</div>
+  </section>
+
+</main>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   DEVOLUCIÓN POR ESCANEO — la parte que decide
+
+   Circuito:
+     CELULAR  escanea la etiqueta de la caja («ML-<pedido>») → ve qué
+              salió en ese remito → dice cuántas cajas volvieron y cómo →
+              queda una devolución PENDIENTE.
+     PC       (facturación) la ve en «↩️ Devoluciones por acreditar» y con
+              un toque abre la nota de crédito ya cargada. Recién ahí se
+              mueve stock y cuenta corriente, en un solo paso.
+
+   El celular NO toca stock ni plata. Una caja devuelta que se cuenta como
+   stock antes de tener su nota de crédito es un agujero entre el depósito
+   y la cuenta del cliente; por eso las dos cosas se mueven juntas y con
+   la firma de Laura.
+
+   Este archivo no toca pantalla ni almacenamiento: son funciones puras,
+   así el celular, la PC y las pruebas usan exactamente la misma regla.
+   ═══════════════════════════════════════════════════════════════════ */
+(function (global) {
+
+  /* El código de barras de la etiqueta es «ML-» + id del pedido. Un lector
+     USB en teclado español a veces cambia el guion por otro símbolo, o
+     agrega espacios: se tolera todo lo que no sea letra o número entre el
+     «ML» y el id. */
+  function pedidoIdDe(crudo) {
+    const s = String(crudo == null ? "" : crudo).trim();
+    /* Etiqueta con número de caja (ML-<pedido>-<nnn>). La de TOTAL (ML|…) no
+       se acepta a propósito: es la de la carga de reparto (acuerdo anterior). */
+    const b = s.match(/^ML[^A-Za-z0-9|]*([0-9]+)[^A-Za-z0-9|]+[0-9]{3,}\s*$/i);
+    if (b) return b[1];
+    const m = s.match(/^ML[^A-Za-z0-9]*([A-Za-z0-9][A-Za-z0-9_-]*)\s*$/i);
+    return m ? m[1] : null;
+  }
+
+  const unidadDe = r => (r.cajas != null ? "cajas" : "un");
+  const enviadoDe = r => (r.cajas != null ? Number(r.cajas) : Number(r.unidades)) || 0;
+
+  /* Lo que ya se devolvió (notas de crédito emitidas, viene en el
+     snapshot) y lo que ya está pendiente (otras devoluciones del mismo
+     pedido que Laura todavía no acreditó): no se puede devolver dos veces
+     la misma caja. */
+  function pendienteDe(devoluciones, pedidoId) {
+    const suma = {};
+    (devoluciones || []).forEach(d => {
+      if (d.estado !== "pendiente" || String(d.pedido_id) !== String(pedidoId)) return;
+      (d.items || []).forEach(it => {
+        const s = suma[it.ean] || (suma[it.ean] = { cajas: 0, sueltas: 0 });
+        s.cajas += Number(it.cajas) || 0;
+        s.sueltas += Number(it.sueltas) || 0;
+      });
+    });
+    return suma;
+  }
+
+  function renglonesDevolvibles(comp, devoluciones) {
+    if (!comp) return [];
+    const ya = comp.devuelto || {};
+    const pend = pendienteDe(devoluciones, comp.pedido_id);
+    return (comp.renglones || []).map((r, i) => {
+      const unidad = unidadDe(r);
+      const clave = unidad === "cajas" ? "cajas" : "sueltas";
+      const enviado = enviadoDe(r);
+      const restado = ((ya[r.ean] || {})[clave] || 0) + ((pend[r.ean] || {})[clave] || 0);
+      return {
+        i, ean: r.ean, nombre: r.nombre, variante: r.variante || null,
+        unidad, enviado, disponible: Math.max(0, enviado - restado),
+      };
+    });
+  }
+
+  /* Arma el registro que viaja a la PC. `cantidades` = { indiceDeRenglón:
+     { n, sana } }. Devuelve { error } si algo no cierra, para que la
+     pantalla lo diga en vez de mandar una devolución imposible. */
+  function armar(o) {
+    const filas = renglonesDevolvibles(o.comp, o.devoluciones);
+    const items = [];
+    for (const f of filas) {
+      const c = (o.cantidades || {})[f.i];
+      const n = c ? Math.floor(Number(c.n) || 0) : 0;
+      if (n <= 0) continue;
+      if (n > f.disponible) {
+        return { error: "De «" + f.nombre + "» solo se pueden devolver " + f.disponible + " " +
+          (f.unidad === "cajas" ? "caja(s)" : "unidad(es)") + "." };
+      }
+      items.push({
+        ean: f.ean, nombre: f.nombre,
+        cajas: f.unidad === "cajas" ? n : 0, sueltas: f.unidad === "cajas" ? 0 : n,
+        sana: !(c && c.sana === false),
+      });
+    }
+    if (!items.length) return { error: "Poné cuántas cajas volvieron." };
+    if (!o.quien) return { error: "Elegí quién está haciendo la devolución." };
+
+    return {
+      registro: {
+        id: o.id, pedido_id: o.comp.pedido_id, remito: o.comp.numero,
+        cliente_nombre: o.comp.cliente_nombre || "", quien: o.quien,
+        fecha: o.fecha || new Date().toISOString(),
+        estado: "pendiente", nc: null, items,
+      },
+    };
+  }
+
+  function resumen(d) {
+    const cajas = (d.items || []).reduce((a, i) => a + (Number(i.cajas) || 0), 0);
+    const sueltas = (d.items || []).reduce((a, i) => a + (Number(i.sueltas) || 0), 0);
+    const rotas = (d.items || []).filter(i => i.sana === false).length;
+    return { cajas, sueltas, rotas };
+  }
+
+  global.DevolucionLogica = { pedidoIdDe, renglonesDevolvibles, pendienteDe, armar, resumen };
+  if (typeof module !== "undefined" && module.exports) module.exports = global.DevolucionLogica;
+
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+<script>
+(function () {
+  const D = window.DevolucionLogica;
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  /* ── Quién ──────────────────────────────────────────────────────
+     El celular lo comparten dos personas: el nombre se vuelve a pedir
+     después de un rato, porque una devolución con el nombre equivocado
+     es peor que una sin nombre. */
+  const OPERARIOS = ["MARCELO", "JUAN"], K_QUIEN = "qr_dev_quien_v1", VIGENCIA_MIN = 60;
+  let quien = null;
+  try {
+    const q = JSON.parse(localStorage.getItem(K_QUIEN) || "null");
+    if (q && q.nombre && Date.now() - q.desde < VIGENCIA_MIN * 60000) quien = q.nombre;
+  } catch (e) {}
+  function pintarQuien() {
+    $("quienes").innerHTML = OPERARIOS.map(n =>
+      '<button class="quien' + (quien === n ? " on" : "") + '" data-n="' + n + '">' + n + "</button>").join("");
+    $("quienes").querySelectorAll("button").forEach(b => b.onclick = () => {
+      quien = b.dataset.n;
+      try { localStorage.setItem(K_QUIEN, JSON.stringify({ nombre: quien, desde: Date.now() })); } catch (e) {}
+      pintarQuien();
+    });
+  }
+  pintarQuien();
+
+  /* ── Datos que vienen de la PC ─────────────────────────────────── */
+  let snapshot = { comprobantes: [], publicado: null }, devoluciones = [];
+  async function traer() {
+    const [s, d] = await Promise.all([
+      fetch("/api/puente/snapshot", { cache: "no-store" }).then(r => r.json()),
+      fetch("/api/puente/devoluciones", { cache: "no-store" }).then(r => r.json()),
+    ]);
+    snapshot = s; devoluciones = d.devoluciones || [];
+  }
+
+  function pintarHistorial() {
+    const ult = devoluciones.slice().reverse().slice(0, 8);
+    if (!ult.length) { $("historial").className = "vacio"; $("historial").textContent = "Todavía no registraste ninguna."; return; }
+    $("historial").className = "";
+    $("historial").innerHTML = ult.map(d => {
+      const r = D.resumen(d);
+      return '<div class="hist"><div><b>' + esc(d.cliente_nombre || "Pedido " + d.pedido_id) + "</b><br>" +
+        '<span class="sub">' + r.cajas + " caja(s)" + (r.sueltas ? " + " + r.sueltas + " un." : "") +
+        (r.rotas ? " · " + r.rotas + " dañada(s)" : "") + " · " + esc(d.quien || "") + "</span></div>" +
+        (d.estado === "acreditada"
+          ? '<span class="chip a">✓ ' + esc(d.nc || "acreditada") + "</span>"
+          : '<span class="chip p">esperando nota de crédito</span>') + "</div>";
+    }).join("");
+  }
+
+  /* ── Escaneo ─────────────────────────────────────────────────────── */
+  let cerrarCam = null, comp = null, cantidades = {};
+
+  function msg(id, tipo, texto) { $(id).innerHTML = texto ? '<div class="msg ' + tipo + '">' + texto + "</div>" : ""; }
+
+  async function abrirPedido(crudo) {
+    const id = D.pedidoIdDe(crudo);
+    if (!id) return msg("msgEscaneo", "err", "Ese código no es de una etiqueta de pedido (tiene que empezar con <b>ML-</b>).");
+    try { await traer(); } catch (e) {
+      return msg("msgEscaneo", "err", "No llego a la PC. Revisá que el celular esté en el mismo wifi y que la PC tenga el servidor prendido.");
+    }
+    pintarHistorial();
+    const c = (snapshot.comprobantes || []).find(x => String(x.pedido_id) === String(id));
+    if (!c) {
+      return msg("msgEscaneo", "err", "No encuentro el pedido <b>" + esc(id) + "</b> con remito emitido." +
+        (snapshot.publicado ? "" : " La PC todavía no publicó nada: abrí <b>Facturación</b> en la PC.") );
+    }
+    const filas = D.renglonesDevolvibles(c, devoluciones);
+    if (!filas.some(f => f.disponible > 0)) {
+      return msg("msgEscaneo", "aviso", "De este pedido ya no queda nada por devolver (todo está acreditado o esperando nota de crédito).");
+    }
+    comp = c; cantidades = {};
+    msg("msgEscaneo", "", "");
+    detenerCamara();
+    pintarPedido();
+  }
+
+  function pintarPedido() {
+    const filas = D.renglonesDevolvibles(comp, devoluciones);
+    $("pCliente").textContent = comp.cliente_nombre || ("Pedido " + comp.pedido_id);
+    $("pRemito").textContent = "Remito " + comp.numero;
+    $("filas").innerHTML = filas.map(f => {
+      const c = cantidades[f.i] || { n: 0, sana: true };
+      return '<div class="fila' + (f.disponible ? "" : " sin") + '" data-i="' + f.i + '">' +
+        '<div class="art">' + esc(f.nombre) + (f.variante ? " · " + esc(f.variante) : "") + "</div>" +
+        '<div class="det">salieron ' + f.enviado + (f.unidad === "cajas" ? " caja(s)" : " un.") +
+        (f.disponible < f.enviado ? " · se pueden devolver " + f.disponible : "") + "</div>" +
+        (f.disponible ? '<div class="ctl"><button class="paso" data-d="-1">−</button><span class="n">' + c.n + '</span>' +
+          '<button class="paso" data-d="1">+</button>' +
+          '<div class="estado"><button class="est sana' + (c.sana ? " on" : "") + '" data-s="1">Sana</button>' +
+          '<button class="est rota' + (!c.sana ? " on" : "") + '" data-s="0">Dañada</button></div></div>' : "") + "</div>";
+    }).join("");
+
+    $("filas").querySelectorAll(".fila").forEach(el => {
+      const i = +el.dataset.i, f = filas[i];
+      el.querySelectorAll(".paso").forEach(b => b.onclick = () => {
+        const c = cantidades[i] || (cantidades[i] = { n: 0, sana: true });
+        c.n = Math.max(0, Math.min(f.disponible, c.n + (+b.dataset.d)));
+        pintarPedido();
+      });
+      el.querySelectorAll(".est").forEach(b => b.onclick = () => {
+        const c = cantidades[i] || (cantidades[i] = { n: 0, sana: true });
+        c.sana = b.dataset.s === "1";
+        pintarPedido();
+      });
+    });
+    $("secPedido").classList.remove("oculto");
+    $("secEscaneo").classList.add("oculto");
+  }
+
+  function volverAEscanear() {
+    comp = null; cantidades = {};
+    $("secPedido").classList.add("oculto");
+    $("secEscaneo").classList.remove("oculto");
+    msg("msgPedido", "", "");
+    $("codigo").value = "";
+  }
+
+  $("btnOtra").onclick = volverAEscanear;
+
+  $("btnRegistrar").onclick = async () => {
+    const id = "dvc-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const r = D.armar({ id, comp, devoluciones, cantidades, quien });
+    if (r.error) return msg("msgPedido", "err", esc(r.error));
+    $("btnRegistrar").disabled = true;
+    try {
+      const resp = await fetch("/api/puente/devoluciones", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(r.registro),
+      });
+      const j = await resp.json();
+      if (!resp.ok) throw new Error(j.error || "no se pudo guardar");
+      const res = D.resumen(r.registro);
+      volverAEscanear();
+      await traer(); pintarHistorial();
+      msg("msgEscaneo", "ok", "✓ Devolución registrada: " + res.cajas + " caja(s)" + (res.sueltas ? " + " + res.sueltas + " un." : "") +
+        ". Laura la ve en Facturación para hacer la nota de crédito.");
+    } catch (e) {
+      msg("msgPedido", "err", "No se pudo guardar: " + esc(e.message) + ". Probá de nuevo.");
+    }
+    $("btnRegistrar").disabled = false;
+  };
+
+  $("btnBuscar").onclick = () => { const v = $("codigo").value.trim(); if (v) abrirPedido(v); };
+  $("codigo").addEventListener("keydown", e => { if (e.key === "Enter") $("btnBuscar").click(); });
+
+  /* ── Cámara ───────────────────────────────────────────────────────
+     BarcodeDetector viene en Chrome de Android. Pide https (o localhost). */
+  function detenerCamara() {
+    if (cerrarCam) { cerrarCam(); cerrarCam = null; }
+    $("video").classList.add("oculto");
+    $("btnCam").textContent = "📷 Prender la cámara";
+  }
+
+  async function prenderCamara() {
+    if (!window.isSecureContext) {
+      return msg("msgEscaneo", "err", "La cámara solo anda en una página segura. Entrá por <b>https://…:8766</b> (ver el link que te pasó Claude) o escribí el código a mano.");
+    }
+    if (!window.BarcodeDetector) {
+      return msg("msgEscaneo", "err", "Este navegador no lee códigos de barras con la cámara. Probá con Chrome, o escribí el código a mano.");
+    }
+    try {
+      const detector = new BarcodeDetector({ formats: ["code_128"] });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1280 } } });
+      const v = $("video");
+      v.srcObject = stream; await v.play();
+      v.classList.remove("oculto");
+      $("btnCam").textContent = "⏹ Apagar la cámara";
+      let vivo = true, ultimo = "", ultimoEn = 0;
+      cerrarCam = () => { vivo = false; try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} v.srcObject = null; };
+      const loop = async () => {
+        if (!vivo) return;
+        try {
+          const cs = await detector.detect(v);
+          if (cs && cs.length) {
+            const c = String(cs[0].rawValue || ""), t = Date.now();
+            if (c && (c !== ultimo || t - ultimoEn > 3000)) { ultimo = c; ultimoEn = t; if (navigator.vibrate) navigator.vibrate(60); abrirPedido(c); }
+          }
+        } catch (e) {}
+        if (vivo) requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+      msg("msgEscaneo", "", "");
+    } catch (e) {
+      msg("msgEscaneo", "err", "No pude prender la cámara (" + esc(e.name || e.message) + "). Dale permiso de cámara al navegador o escribí el código.");
+    }
+  }
+
+  $("btnCam").onclick = () => { if (cerrarCam) detenerCamara(); else prenderCamara(); };
+
+  traer().then(pintarHistorial).catch(() => { $("historial").textContent = "No llego a la PC todavía."; });
+  /* El remito se busca al escanear, y ahí se baja todo. El historial se mantiene con el aviso
+     de cambios, solo con la pantalla a la vista: no vuelve a bajar los remitos cada pocos segundos. */
+  const refrescarHistorial = () => {
+    if (comp || document.hidden) return;
+    fetch("/api/puente/devoluciones", { cache: "no-store" }).then(r => r.json())
+      .then(d => { devoluciones = d.devoluciones || []; pintarHistorial(); }).catch(() => {});
+  };
+  if (window.QRSrv && QRSrv.escuchar) QRSrv.escuchar(["qr_devoluciones"], refrescarHistorial);
+  else setInterval(refrescarHistorial, 6000);
+  document.addEventListener("visibilitychange", refrescarHistorial);
+})();
+</script>
+</body>
+</html>
