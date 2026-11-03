@@ -83,7 +83,7 @@
       aviso.setAttribute("role", "alert");
       aviso.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:2147483647;background:#b91c1c;color:#fff;" +
         "font:700 14px/1.35 system-ui,sans-serif;padding:10px 14px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,.3)";
-      aviso.textContent = "⚠️ Sin conexión con el servidor. Lo que hagas ahora NO se guarda (los pedidos del vendedor quedan en su cola y salen solos al volver). Revisá que la ventana del servidor siga abierta.";
+      aviso.textContent = "⚠️ Sin conexión con el servidor. Lo que hagas ahora NO se guarda (los pedidos del vendedor quedan en su cola y salen solos al volver). Revisá tu conexión a Internet.";
       document.body.appendChild(aviso);
     } else if (!caido && aviso) { aviso.remove(); aviso = null; }
   }
@@ -280,7 +280,7 @@
     avisoGen = document.createElement("div");
     avisoGen.id = "qrAvisoGeneracion"; avisoGen.setAttribute("role", "alert");
     avisoGen.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:2147483647;background:#7c2d12;color:#fff;font:700 14px/1.35 system-ui,sans-serif;padding:10px 14px;text-align:center";
-    avisoGen.innerHTML = "⚠️ Esta pantalla es de antes de que se renovara el entorno de prueba: lo que hagas no se guarda. " +
+    avisoGen.innerHTML = "⚠️ Esta pantalla quedó desactualizada: lo que hagas no se guarda. " +
       "<button type=\"button\" style=\"margin-left:8px;font:inherit;padding:4px 10px;border-radius:8px;border:0;cursor:pointer\" onclick=\"location.reload()\">Recargar</button>";
     document.body.appendChild(avisoGen);
   }
@@ -303,7 +303,7 @@
         avisoApartadas = document.createElement("div");
         avisoApartadas.id = "qrAvisoApartadas"; avisoApartadas.setAttribute("role", "status");
         avisoApartadas.style.cssText = "position:fixed;left:12px;right:12px;bottom:12px;z-index:2147483646;background:#fef3c7;color:#78350f;border:2px solid #f59e0b;border-radius:12px;font:600 13.5px/1.4 system-ui,sans-serif;padding:10px 14px";
-        avisoApartadas.innerHTML = "Este equipo tenía operaciones guardadas sin enviar de antes de renovar el entorno (" + apartadas.length + "). <b>No se enviaron</b>: quedaron apartadas en el equipo. " +
+        avisoApartadas.innerHTML = "Este equipo tenía operaciones guardadas sin enviar de una versión anterior (" + apartadas.length + "). <b>No se enviaron</b>: quedaron apartadas en el equipo. " +
           "<button type=\"button\" style=\"margin-left:6px;font:inherit;padding:3px 10px;border-radius:8px;border:1px solid #b45309;background:#fff;cursor:pointer\" onclick=\"this.parentNode.remove()\">Entendido</button>";
         document.body.appendChild(avisoApartadas);
       };
@@ -311,7 +311,7 @@
     }
   }
 
-  /* ── Sin service workers en el sistema de prueba ──────────────────
+  /* ── Sin service workers en el sistema ──────────────────
      Guardarían copias de las páginas y, al rearmarlas, se seguiría viendo
      la versión vieja. Se contesta un registro de mentira para que las
      pantallas que lo esperan no fallen. */
@@ -606,7 +606,7 @@
      El celular lo comparten dos personas: el nombre se vuelve a pedir
      después de un rato, porque una devolución con el nombre equivocado
      es peor que una sin nombre. */
-  const OPERARIOS = ["MARCELO", "JUAN"], K_QUIEN = "qr_dev_quien_v1", VIGENCIA_MIN = 60;
+  const OPERARIOS = ["RODRIGO", "ADRIÁN"], K_QUIEN = "qr_dev_quien_v1", VIGENCIA_MIN = 60;
   let quien = null;
   try {
     const q = JSON.parse(localStorage.getItem(K_QUIEN) || "null");
@@ -657,13 +657,13 @@
     const id = D.pedidoIdDe(crudo);
     if (!id) return msg("msgEscaneo", "err", "Ese código no es de una etiqueta de pedido (tiene que empezar con <b>ML-</b>).");
     try { await traer(); } catch (e) {
-      return msg("msgEscaneo", "err", "No llego a la PC. Revisá que el celular esté en el mismo wifi y que la PC tenga el servidor prendido.");
+      return msg("msgEscaneo", "err", "No llego al servidor. Revisá la conexión a Internet.");
     }
     pintarHistorial();
     const c = (snapshot.comprobantes || []).find(x => String(x.pedido_id) === String(id));
     if (!c) {
       return msg("msgEscaneo", "err", "No encuentro el pedido <b>" + esc(id) + "</b> con remito emitido." +
-        (snapshot.publicado ? "" : " La PC todavía no publicó nada: abrí <b>Facturación</b> en la PC.") );
+        (snapshot.publicado ? "" : "") );
     }
     const filas = D.renglonesDevolvibles(c, devoluciones);
     if (!filas.some(f => f.disponible > 0)) {
@@ -787,7 +787,7 @@
 
   $("btnCam").onclick = () => { if (cerrarCam) detenerCamara(); else prenderCamara(); };
 
-  traer().then(pintarHistorial).catch(() => { $("historial").textContent = "No llego a la PC todavía."; });
+  traer().then(pintarHistorial).catch(() => { $("historial").textContent = "No llego al servidor todavía."; });
   /* El remito se busca al escanear, y ahí se baja todo. El historial se mantiene con el aviso
      de cambios, solo con la pantalla a la vista: no vuelve a bajar los remitos cada pocos segundos. */
   const refrescarHistorial = () => {
