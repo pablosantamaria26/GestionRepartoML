@@ -126,7 +126,7 @@
   }
   /* El enlace del puesto se guarda al abrir: hay pantallas que casi no consultan al arrancar. */
   if (PROD && window.QR_PUESTO !== "vendedor" && /[#&]puesto=/.test(location.hash)) tokenPuesto();
-  function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; return h; }
+  function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; try { var c = JSON.parse(localStorage.getItem("rep_cred_v1") || "null"); if (c && c.t) h["X-Chofer"] = c.t; } catch (e) {} return h; }
   function vigilarToken(status) {
     if (!PROD || status !== 401) return;
     if (PANEL_TOKEN) return panelToken({ estado: "incorrecto" });

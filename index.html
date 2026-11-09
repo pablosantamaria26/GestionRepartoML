@@ -1,6 +1,132 @@
 ﻿<!DOCTYPE html>
 <html lang="es">
 <head>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   LLAVE DEL TELÉFONO DEL CHOFER
+
+   El teléfono se habilita una sola vez con el enlace que Administración
+   genera y comparte desde Carga. Desde ahí el servidor sabe quién es: la
+   app ya no manda un nombre elegido a mano ni lee el reparto por afuera.
+
+   SIN LLAVE todo sigue exactamente como antes (Firebase incluido), hasta
+   que se encienda la exigencia en el servidor. CON LLAVE, los datos del
+   reparto van solo por el servidor, con la misma cola local de siempre.
+
+   Nunca borra operaciones: las de otra persona quedan guardadas aparte.
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  const K = "rep_cred_v1", K_ALTA = "rep_cred_alta_v1", URL_API = "https://gestiondereparto.santamariapablodaniel.workers.dev/";
+  const COLAS = ["rq", "pq", "rendicion_pending", "qr_reparto_cola_v1", "qr_rend_pendiente_v1"];
+  const leerJ = (k, d) => { try { const v = JSON.parse(localStorage.getItem(k) || "null"); return v == null ? d : v; } catch (e) { return d; } };
+  let cred = leerJ(K, null);
+  const activa = () => !!(cred && cred.t);
+  const norm = s => String(s || "").trim().toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\s+/g, " ");
+
+  function pendientes() {
+    return { entregas: leerJ("rq", []).length, fotos: leerJ("pq", []).length, rendicion: !!localStorage.getItem("rendicion_pending"), queruclor: leerJ("qr_reparto_cola_v1", []).length + (localStorage.getItem("qr_rend_pendiente_v1") ? 1 : 0) };
+  }
+  const firmar = b => (activa() && b.action !== "activarChofer") ? Object.assign({}, b, { cred: cred.t, pend: pendientes() }) : b;
+
+  function panel(titulo, texto, boton, alTocar) {
+    let p = document.getElementById("repCredPanel");
+    if (!p) { p = document.createElement("div"); p.id = "repCredPanel"; p.style.cssText = "position:fixed;inset:0;z-index:2147483646;background:#0f2837;color:#fff;display:flex;align-items:center;justify-content:center;padding:24px;font:16px/1.45 system-ui,sans-serif;text-align:center"; document.body.appendChild(p); }
+    p.innerHTML = '<div style="max-width:360px"><div style="font-size:21px;font-weight:800;margin-bottom:10px" id="rcT"></div><div id="rcX"></div>' + (boton ? '<button id="rcB" style="margin-top:20px;padding:13px 22px;border:0;border-radius:10px;background:#4ea09b;color:#fff;font:inherit;font-weight:700">' + boton + "</button>" : "") + "</div>";
+    p.querySelector("#rcT").textContent = titulo; p.querySelector("#rcX").textContent = texto;
+    if (boton) p.querySelector("#rcB").onclick = alTocar;
+  }
+  const cerrarPanel = () => { const p = document.getElementById("repCredPanel"); if (p) p.remove(); };
+  function textoPend() {
+    const p = pendientes(), n = p.entregas + p.fotos + (p.rendicion ? 1 : 0) + p.queruclor;
+    return n ? " Hay " + n + " operación" + (n === 1 ? "" : "es") + " sin enviar: quedan guardadas en este teléfono." : "";
+  }
+
+  /* Si el servidor rechaza, se lanza error: la cola se conserva y no se da nada por enviado. */
+  function revisar(r) {
+    if (r && (r.codigo === "NO_HABILITADO" || r.codigo === "REVOCADO")) {
+      if (r.codigo === "REVOCADO") panel("Este teléfono fue reemplazado", "Avisá a Administración." + textoPend());
+      else panel("Teléfono sin habilitar", "Pedí a Administración el enlace para habilitar este teléfono." + textoPend());
+      throw new Error(r.codigo);
+    }
+    if (r && r.codigo === "SIN_REPARTO") throw new Error("SIN_REPARTO");
+    return r;
+  }
+
+  /* Lo guardado por otra persona en este teléfono no se envía a nombre del chofer nuevo ni se borra. */
+  function apartarAjeno(chofer) {
+    const dueno = (cred && cred.id !== chofer.id) ? cred.op : (!cred ? localStorage.getItem("rep_name") : "");
+    if (!dueno || norm(dueno) === norm(chofer.operativo) || norm(dueno) === norm(chofer.nombre)) return 0;
+    let n = 0;
+    Object.keys(localStorage).filter(k => COLAS.includes(k) || /^(c_|last_|backup_)/.test(k)).forEach(k => {
+      localStorage.setItem("ajeno_" + dueno + "__" + k, localStorage.getItem(k)); localStorage.removeItem(k); if (COLAS.includes(k)) n++;
+    });
+    return n;
+  }
+
+  function nuevaLlave() { const b = crypto.getRandomValues(new Uint8Array(32)); return Array.from(b, x => ("0" + x.toString(16)).slice(-2)).join(""); }
+
+  async function activar(codigo, seguir) {
+    /* La llave se guarda ANTES de llamar: si la respuesta se pierde, el reintento usa la misma. */
+    let a = leerJ(K_ALTA, null);
+    if (!a || a.codigo !== codigo) { a = { codigo, cred: nuevaLlave() }; localStorage.setItem(K_ALTA, JSON.stringify(a)); }
+    panel("Habilitando este teléfono…", "");
+    let r;
+    try {
+      const f = await fetch(URL_API, { method: "POST", headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ action: "activarChofer", codigo: a.codigo, cred: a.cred, dispositivo: navigator.userAgent.replace(/^.*?\(([^)]*)\).*$/, "$1").slice(0, 110) }) });
+      r = await f.json();
+    } catch (e) { panel("Sin conexión", "No se pudo habilitar el teléfono. Conectate y reintentá: el enlace sigue sirviendo.", "Reintentar", () => activar(codigo, seguir)); return; }
+    if (!r || !r.success) {
+      localStorage.removeItem(K_ALTA);
+      panel("No se pudo habilitar", (r && r.message) || "Pedí un enlace nuevo a Administración.", "Entendido", () => { cerrarPanel(); if (activa()) entrar(seguir); else location.reload(); });
+      return;
+    }
+    const aparte = apartarAjeno(r.chofer);
+    cred = { t: a.cred, id: r.chofer.id, op: r.chofer.operativo, nombre: r.chofer.nombre };
+    localStorage.setItem(K, JSON.stringify(cred)); localStorage.setItem("rep_name", r.chofer.operativo); localStorage.removeItem(K_ALTA);
+    if (aparte) panel("Teléfono habilitado", "Quedaron guardadas aparte operaciones de otra persona: no se envían a tu nombre. Avisá a Administración.", "Continuar", () => { cerrarPanel(); entrar(seguir); });
+    else { cerrarPanel(); entrar(seguir); }
+  }
+  function entrar(seguir) { S.rep = cred.op; document.getElementById("loginScreen").style.display = "none"; seguir(); }
+
+  /* Devuelve true si se hizo cargo del ingreso. */
+  function arrancar(seguir) {
+    const m = /[#&]alta=([0-9a-f]{64})/.exec(location.hash);
+    if (m) { try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {} activar(m[1], seguir); return true; }
+    const a = leerJ(K_ALTA, null);
+    if (a && !activa()) { activar(a.codigo, seguir); return true; }
+    if (activa()) { entrar(seguir); return true; }
+    return false;
+  }
+
+  const NULA = { once: async () => ({ val: () => null }), set: async () => {}, remove: async () => {}, on() {}, off() {} };
+  function envolverDb(db) { const o = db.ref.bind(db); db.ref = p => (activa() ? NULA : o(p)); return db; }
+
+  /* Reemplazos de lo que antes se leía directo de Supabase: misma forma que la respuesta de fetch. */
+  const comoFetch = (ok, filas) => ({ ok, json: async () => filas });
+  async function miReparto(turno) { try { const r = await gp({ action: "miReparto", turno }); return comoFetch(true, [{ pedidos: (r && r.pedidos) || [] }]); } catch (e) { return comoFetch(false, []); } }
+  async function historial(extra) { try { const r = await gp(Object.assign({ action: "miHistorial" }, extra)); return comoFetch(!!(r && r.success), (r && r.filas) || []); } catch (e) { return comoFetch(false, []); } }
+  async function rendicionHecha(rp) { try { const r = await gp({ action: "rendicionHecha", fecha: rp.fecha, turno: rp.turno }); return comoFetch(!!(r && r.success), (r && r.filas) || []); } catch (e) { return comoFetch(false, []); } }
+
+  /* Solo se saca de la cola lo que el servidor confirmó. */
+  function exigirOk(r) { if (!r || r.success !== true) throw new Error((r && r.message) || "No confirmado"); return r; }
+
+  /* Foto: lo que se encola es lo mismo que se intentó subir, así el reintento no crea otro archivo. */
+  const fotos = new WeakMap();
+  const recordarFoto = (f, b) => { try { fotos.set(f, b); } catch (e) {} return b; };
+  const fotoDe = f => fotos.get(f);
+
+  /* Reabrir sin señal: el turno se puede elegir si este teléfono tiene su lista guardada. */
+  function sinSenal(aplicar) {
+    if (!activa()) return;
+    const hoy = fAR(), est = {};
+    ["Mañana", "Tarde"].forEach(t => { est[t] = leerJ("c_" + hoy + "_" + t, []).length ? "abierto" : "sinDatos"; });
+    aplicar(est);
+  }
+
+  window.RepCred = { activa, sinSenal, llave: () => cred && cred.t, firmar, revisar, arrancar, envolverDb, miReparto, historial, rendicionHecha, exigirOk, recordarFoto, fotoDe, pendientes };
+})();
+
+</script>
 <script>window.QR_PROD_API="https://queruclor-api.santamariapablodaniel.workers.dev";window.QR_API_BASE="https://queruclor-api.santamariapablodaniel.workers.dev";window.QR_PUESTO="reparto";window.QR_URL_REGISTRO="https://frosty-term-20ea.santamariapablodaniel.workers.dev/";window.QR_FOTOS_BASE="https://gjeyvbidomxzofcdycya.supabase.co/storage/v1/object/public/qr-fotos/";</script>
 <script>
 /* ═══════════════════════════════════════════════════════════════════
@@ -126,7 +252,7 @@
   }
   /* El enlace del puesto se guarda al abrir: hay pantallas que casi no consultan al arrancar. */
   if (PROD && window.QR_PUESTO !== "vendedor" && /[#&]puesto=/.test(location.hash)) tokenPuesto();
-  function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; return h; }
+  function conToken(h) { var t = tokenPuesto(); if (t) h["X-QR-Token"] = t; try { var c = JSON.parse(localStorage.getItem("rep_cred_v1") || "null"); if (c && c.t) h["X-Chofer"] = c.t; } catch (e) {} return h; }
   function vigilarToken(status) {
     if (!PROD || status !== 401) return;
     if (PANEL_TOKEN) return panelToken({ estado: "incorrecto" });
@@ -879,8 +1005,8 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
 // ═══════════════════════ CONFIG ═══════════════════════
 const FB={apiKey:"AIzaSyAnkoNLZVW6bsus3XzJUZTNWWYaFNwKIwU",authDomain:"mercadolimpio-reparto.firebaseapp.com",databaseURL:"https://mercadolimpio-reparto-default-rtdb.firebaseio.com",projectId:"mercadolimpio-reparto",storageBucket:"mercadolimpio-reparto.firebasestorage.app",messagingSenderId:"283563066503",appId:"1:283563066503:web:db5ad2f760f9811fdae422"};
 const WURL='https://gestiondereparto.santamariapablodaniel.workers.dev/';
-firebase.initializeApp(FB);firebase.auth().signInAnonymously().catch(e=>console.warn('Auth:',e));
-const db=firebase.database();
+firebase.initializeApp(FB);(RepCred.activa()?Promise.resolve():firebase.auth().signInAnonymously()).catch(e=>console.warn('Auth:',e));
+const db=RepCred.envolverDb(firebase.database());
 const S={rep:'',turno:'',peds:[],mi:-1,sav:false,lk:false,fp1:'',fp2:'',a1:0,a2:0};
 const $=id=>document.getElementById(id);
 const fAR=()=>{const d=new Date(),o=d.getTimezoneOffset()+(-3*60);return new Date(d.getTime()-o*60000).toISOString().slice(0,10);};
@@ -904,12 +1030,13 @@ function uSyncBadge(){
 // ═══════════════════ GAS POST ════════════════════════
 async function gp(body,to=15000){
   const c=new AbortController(),t=setTimeout(()=>c.abort(),to);
-  try{const r=await fetch(WURL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(body),signal:c.signal});clearTimeout(t);return r.json();}
+  try{const r=await fetch(WURL,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(RepCred.firmar(body)),signal:c.signal});clearTimeout(t);return RepCred.revisar(await r.json());}
   catch(e){clearTimeout(t);throw e;}
 }
 
 // ═══════════════════ LOGIN ═══════════════════════════
 function initLogin(){
+  if(RepCred.arrancar(showTS))return;
   const k=`r_${fAR()}`;
   // Buscar nombre hoy, o el último nombre guardado permanentemente
   const sv=localStorage.getItem(k)||localStorage.getItem('rep_name');
@@ -944,7 +1071,7 @@ async function checkTS(){
   try{const s=await db.ref(fbE()).once('value');const e=s.val();if(e)applyTB(e);}catch(_){}
   try{const r=await gp({action:'getEstadoTurnos',repartidor:S.rep});
     if(r&&r.estado){applyTB(r.estado);try{await db.ref(fbE()).set(r.estado);}catch(_){}}}
-  catch(e){console.warn('GAS turno:',e);}
+  catch(e){console.warn('GAS turno:',e);RepCred.sinSenal(applyTB);}
 }
 
 function applyTB(e){
@@ -956,7 +1083,7 @@ function applyTB(e){
     const st=e[t]||'sinDatos',b=t==='Mañana'?$('turnoM'):$('turnoT'),s=t==='Mañana'?$('tMS'):$('tTS');
     if(st==='finalizado'){b.disabled=true;s.textContent='🔒 Rendición enviada';s.style.color='rgba(255,100,100,.9)';}
     else if(st==='abierto'){b.disabled=false;s.textContent='📦 Reparto activo — listo para empezar';s.style.color='rgba(110,231,183,.9)';}
-    else{b.disabled=true;s.textContent='Sin reparto cargado';s.style.color='rgba(255,255,255,.35)';}
+    else{b.disabled=true;s.textContent=RepCred.activa()?'Sin reparto asignado':'Sin reparto cargado';s.style.color='rgba(255,255,255,.35)';}
   });
   if(e['Mañana']==='finalizado'&&e['Tarde']==='finalizado')toast('🟢 Jornada completa — ambos turnos finalizados',5000);
   if((e['Mañana']||'sinDatos')==='sinDatos'&&(e['Tarde']||'sinDatos')==='sinDatos')toast('No hay repartos cargados para hoy',4000);
@@ -993,7 +1120,7 @@ async function startApp(){
   // 2) localStorage
   if(!ok){const c=localStorage.getItem(`c_${fAR()}_${S.turno}`);if(c){try{S.peds=JSON.parse(c);render();hLoad();ok=true;toast('📱 Desde caché');}catch(_){}}}
   // 2.5) Supabase — carga instantánea si el admin ya cargó el reparto hoy
-  if(!ok){try{
+  if(!ok&&!RepCred.activa()){try{
     const _sb=await fetch('https://gjeyvbidomxzofcdycya.supabase.co/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
       {headers:{'apikey':'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdqZXl2Ymlkb214em9mY2R5Y3lhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMjc5MzAsImV4cCI6MjA4ODgwMzkzMH0.B1mg_CNsl7Gx-MdTsXSqkUDPJwvpNiek7-lf_LeaeL4',
                'Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdqZXl2Ymlkb214em9mY2R5Y3lhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMjc5MzAsImV4cCI6MjA4ODgwMzkzMH0.B1mg_CNsl7Gx-MdTsXSqkUDPJwvpNiek7-lf_LeaeL4'}});
@@ -1165,10 +1292,10 @@ async function confirmDel(){
   toast(fp1==='No pagó'?'🚫 Entregado (sin pago)':'✅ Entregado');
 
   // Monitor: fire & forget
-  fetch(CF_WORKER+'/update-entrega',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:fAR(),turno:S.turno,pedidos:S.peds})}).catch(()=>{});
+  if(!RepCred.activa())fetch(CF_WORKER+'/update-entrega',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fecha:fAR(),turno:S.turno,pedidos:S.peds})}).catch(()=>{});
 
   // GAS: background sin bloquear UI — encola si falla
-  gp({action:'guardarDatosReparto',pedidos:[p]}).catch(()=>qR(p));
+  gp({action:'guardarDatosReparto',pedidos:[p]}).then(RepCred.exigirOk).catch(()=>qR(p));
 }
 
 // ═══════════════════ OFFLINE QUEUE ═══════════════════
@@ -1178,7 +1305,7 @@ async function fR(){
   // Flush pedidos queue
   const q=JSON.parse(localStorage.getItem('rq')||'[]');
   if(q.length>0){
-    try{await gp({action:'guardarDatosReparto',pedidos:q});localStorage.removeItem('rq');toast('📤 '+q.length+' pedido(s) sincronizado(s)');}
+    try{RepCred.exigirOk(await gp({action:'guardarDatosReparto',pedidos:q}));localStorage.removeItem('rq');toast('📤 '+q.length+' pedido(s) sincronizado(s)');}
     catch(_){console.warn('Flush retry failed, keeping queue');}
   }
   // Flush photos queue
@@ -1205,7 +1332,7 @@ async function fR(){
     const pqNow=JSON.parse(localStorage.getItem('pq')||'[]');
     if(rqNow.length===0&&pqNow.length===0){
       try{
-        const r=await gp({action:'enviarRendicion',repartidor:rp.rep,turno:rp.turno},30000);
+        const r=await gp({action:'enviarRendicion',repartidor:rp.rep,turno:rp.turno,fecha:rp.fecha},30000);
         if(r&&r.success){
           localStorage.removeItem('rendicion_pending');
           localStorage.removeItem(`c_${rp.fecha}_${rp.turno}`);
@@ -1249,7 +1376,7 @@ async function sumarNuevosOficina(){
   if(_nuevosEnCurso||!S.turno||S.lk||S.sav||document.hidden||!navigator.onLine||!Array.isArray(S.peds))return;
   _nuevosEnCurso=true;
   try{
-    const sb=await fetch(SB_URL+'/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
+    const sb=RepCred.activa()?await RepCred.miReparto(S.turno):await fetch(SB_URL+'/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
       {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(5000)});
     if(!sb.ok)return;
     const d=await sb.json();
@@ -1272,13 +1399,13 @@ function encolarFotoPendiente_(p,f){
   try{
     if(!p.comprobanteId){p.comprobanteId='pending_'+p.numeroCliente;cL();render();}
     const q=JSON.parse(localStorage.getItem('pq')||'[]');
-    const r2=new FileReader();r2.onload=e=>{q.push({b:e.target.result.split(',')[1],n:p.numeroCliente});localStorage.setItem('pq',JSON.stringify(q));uSyncBadge();};
+    const r2=new FileReader();r2.onload=e=>{q.push({b:RepCred.fotoDe(f)||e.target.result.split(',')[1],n:p.numeroCliente});localStorage.setItem('pq',JSON.stringify(q));uSyncBadge();};
     r2.readAsDataURL(f);
   }catch(_){}
 }
 async function hPhoto(f){if(!f||S.mi<0)return;const p=S.peds[S.mi];sLoad('Comprimiendo...');
   try{
-    const b=await compImg(f);sLoad('Subiendo...');
+    const b=RepCred.recordarFoto(f,await compImg(f));sLoad('Subiendo...');
     const r=await gp({action:'subirComprobante',base64:b,numeroCliente:p.numeroCliente},30000);
     if(r&&r.fileId){p.comprobanteId=r.fileId;push1(p);cL();render();toast('📷 Foto subida');}
     else{
@@ -1381,7 +1508,7 @@ async function sendRend(){
   // Cross-check con Supabase: detectar clientes que el admin agregó después que el repartidor cargó la sesión
   $('bSn').disabled=true;
   try{
-    const sb=await fetch(SB_URL+'/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
+    const sb=RepCred.activa()?await RepCred.miReparto(S.turno):await fetch(SB_URL+'/rest/v1/reparto_en_curso?fecha=eq.'+fAR()+'&turno=eq.'+encodeURIComponent(S.turno)+'&select=pedidos',
       {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(3000)});
     if(sb.ok){
       const d=await sb.json();
@@ -1518,7 +1645,7 @@ async function checkRendicionPendiente(){
   const rp=JSON.parse(localStorage.getItem('rendicion_pending')||'null');
   if(!rp)return;
   try{
-    const sb=await fetch(SB_URL+'/rest/v1/rendiciones_reparto?fecha=eq.'+rp.fecha+'&turno=eq.'+encodeURIComponent(rp.turno)+'&repartidor=eq.'+encodeURIComponent(rp.rep)+'&select=fecha',
+    const sb=RepCred.activa()?await RepCred.rendicionHecha(rp):await fetch(SB_URL+'/rest/v1/rendiciones_reparto?fecha=eq.'+rp.fecha+'&turno=eq.'+encodeURIComponent(rp.turno)+'&repartidor=eq.'+encodeURIComponent(rp.rep)+'&select=fecha',
       {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(4000)});
     if(sb.ok){
       const d=await sb.json();
@@ -1568,7 +1695,7 @@ async function pedirConsejoIA(pedidos,turno,rep,fecha){
   try{
     const res=await fetch(CF_WORKER+'/consejo-turno',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({repartidor:rep,turno,fecha,pedidos}),signal:AbortSignal.timeout(12000)
+      body:JSON.stringify(RepCred.firmar({repartidor:rep,turno,fecha,pedidos})),signal:AbortSignal.timeout(12000)
     });
     const d=await res.json();
     if(d.consejo){
@@ -1580,7 +1707,7 @@ async function pedirConsejoIA(pedidos,turno,rep,fecha){
   try{const c=JSON.parse(localStorage.getItem(LS_KEY)||'null');if(c?.consejo)return{consejo:c.consejo,offline:true};}catch(_){}
   // Plan C: Supabase historial anon
   try{
-    const r=await fetch(`${SB_URL}/rest/v1/copiloto_historial?repartidor=eq.${encodeURIComponent(rep)}&order=fecha.desc&limit=1&select=consejo`,
+    const r=RepCred.activa()?await RepCred.historial({limite:1}):await fetch(`${SB_URL}/rest/v1/copiloto_historial?repartidor=eq.${encodeURIComponent(rep)}&order=fecha.desc&limit=1&select=consejo`,
       {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON}});
     const d=await r.json();if(d[0]?.consejo)return{consejo:d[0].consejo,offline:true};
   }catch(_){}
@@ -1592,7 +1719,7 @@ async function loadCopilotoHistory(){
   const scroll=$('cpScroll');
   scroll.innerHTML='<div style="text-align:center;color:var(--tx3);padding:24px;font-size:.85rem">Cargando historial…</div>';
   try{
-    const r=await fetch(`${SB_URL}/rest/v1/copiloto_historial?repartidor=eq.${encodeURIComponent(S.rep)}&order=fecha.desc&limit=20&select=fecha,turno,total_clientes,devueltos,no_pagaron,efectivo,transferencias,localidades,consejo`,
+    const r=RepCred.activa()?await RepCred.historial({limite:20}):await fetch(`${SB_URL}/rest/v1/copiloto_historial?repartidor=eq.${encodeURIComponent(S.rep)}&order=fecha.desc&limit=20&select=fecha,turno,total_clientes,devueltos,no_pagaron,efectivo,transferencias,localidades,consejo`,
       {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON}});
     const data=await r.json();
     if(!data.length){scroll.innerHTML='<div style="text-align:center;color:var(--tx3);padding:24px;font-size:.85rem">Aún no hay historial registrado.<br>El Copiloto aprende con cada rendición.</div>';return;}
