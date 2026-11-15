@@ -105,7 +105,7 @@
   const comoFetch = (ok, filas) => ({ ok, json: async () => filas });
   async function miReparto(turno) { try { const r = await gp({ action: "miReparto", turno }); return comoFetch(true, [{ pedidos: (r && r.pedidos) || [] }]); } catch (e) { return comoFetch(false, []); } }
   async function historial(extra) { try { const r = await gp(Object.assign({ action: "miHistorial" }, extra)); return comoFetch(!!(r && r.success), (r && r.filas) || []); } catch (e) { return comoFetch(false, []); } }
-  async function rendicionHecha(rp) { try { const r = await gp({ action: "rendicionHecha", fecha: rp.fecha, turno: rp.turno }); return comoFetch(!!(r && r.success), (r && r.filas) || []); } catch (e) { return comoFetch(false, []); } }
+  async function rendicionHecha(rp) { try { const r = await gp({ action: "rendicionHecha", fecha: rp.fecha, turno: rp.turno, desde: rp.ts || "" }); return comoFetch(!!(r && r.success), (r && r.filas) || []); } catch (e) { return comoFetch(false, []); } }
 
   /* Solo se saca de la cola lo que el servidor confirmó. */
   function exigirOk(r) { if (!r || r.success !== true) throw new Error((r && r.message) || "No confirmado"); return r; }
@@ -923,6 +923,7 @@ body{font-family:var(--f);background:var(--bg);color:var(--tx);display:flex;flex
       <div class="rend-ok">✅</div>
       <div class="rend-title">¡Rendición enviada!</div>
       <div class="rend-sub">Queda pendiente hasta que Caja la reciba. El PDF es solo el resumen: no es la recepción.</div>
+      <div class="rend-sub" id="rendEstado" style="text-align:left;margin-top:10px;line-height:1.7"></div>
     </div>
     <div class="rend-copiloto" id="rendCopiloto" style="display:none">
       <div class="rend-cp-badge">✈️ Copiloto Mercado Limpio</div>
@@ -1010,7 +1011,12 @@ firebase.initializeApp(FB);(RepCred.activa()?Promise.resolve():firebase.auth().s
 const db=RepCred.envolverDb(firebase.database());
 const S={rep:'',turno:'',peds:[],mi:-1,sav:false,lk:false,fp1:'',fp2:'',a1:0,a2:0};
 const $=id=>document.getElementById(id);
-const fAR=()=>{const d=new Date(),o=d.getTimezoneOffset()+(-3*60);return new Date(d.getTime()-o*60000).toISOString().slice(0,10);};
+/* 15/11/2026: el día operativo se saca de la hora de Argentina (UTC-3, sin horario de verano), nunca de la fecha UTC ni de la zona del teléfono.
+   La versión anterior daba el día SIGUIENTE entre las 21:00 y las 24:00 en un teléfono configurado en Argentina. */
+const fAR=()=>new Date(Date.now()-3*3600000).toISOString().slice(0,10);
+/* 15/11/2026 — La rendición pendiente se identifica por QUIÉN, QUÉ TURNO y CUÁNDO se encoló (ts, instante real), no por la fecha de
+   hoy: la fecha operativa es la del LOTE y puede ser distinta del día en que se envía. El ts del primer intento se conserva. */
+function setRendPend(rep,turno){let ts=new Date().toISOString();try{const p=JSON.parse(localStorage.getItem('rendicion_pending')||'null');if(p&&p.rep===rep&&p.turno===turno&&p.ts)ts=p.ts;}catch(_){}localStorage.setItem('rendicion_pending',JSON.stringify({rep,turno,fecha:fAR(),ts}));}
 const mn=n=>Number(n||0).toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2});
 const fbP=()=>`reparto/${fAR()}/${S.turno}`;
 const fbE=()=>`estado/${fAR()}`;
@@ -1342,7 +1348,7 @@ async function fR(){
           try{await db.ref('reparto/'+rp.fecha+'/'+rp.turno).remove();}catch(_){}
           S.lk=true;S.peds=[];render();
           cerrarRendFail();
-          toast('✅ Rendición enviada correctamente. ¡Todo sincronizado!',5000);
+          toast('✅ Rendición enviada al servidor. Falta que Caja la reciba.',6000);try{localStorage.setItem('rend_ultima',JSON.stringify({rep:rp.rep,turno:rp.turno,ts:rp.ts||new Date().toISOString()}));}catch(_){}
         }else if(r&&!r.success){
           // El servidor rechazó por error de negocio (ej: clientes pendientes): cortar el retry loop
           const errMsg=(r.message)||'Error al enviar';
@@ -1531,7 +1537,7 @@ async function sendRend(){
   if(rq.length>0||pq.length>0){
     if(!navigator.onLine){
       // Sin señal: encolar rendición para enviar automáticamente después de rq/pq
-      try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
+      try{setRendPend(S.rep,S.turno);
           localStorage.setItem(`backup_${fAR()}_${S.turno}`,JSON.stringify(S.peds));}catch(_){}
       toast('📴 Rendición en cola. Se envía automáticamente cuando vuelva internet.',6000);return;
     }
@@ -1545,6 +1551,7 @@ $('cfmYes').addEventListener('click',async()=>{
   $('cfmBg').classList.remove('open');
   const backupKey=`backup_${fAR()}_${S.turno}`;
   const snapshot=[...S.peds];
+  const tsEnvio=new Date().toISOString(),repEnv=S.rep,turnoEnv=S.turno;let pdfListo=false;
   try{localStorage.setItem(backupKey,JSON.stringify(S.peds));}catch(_){}
 
   showRendBg(); // muestra overlay animado
@@ -1572,7 +1579,9 @@ $('cfmYes').addEventListener('click',async()=>{
       // Pasar a fase 2 y mostrar botón WhatsApp
       const waUrl=buildWaUrl(snapshot);
       completeRendBg(waUrl);
-      generarYSubirPDF(snapshot,S.turno,S.rep).catch(e=>console.warn('PDF bg error:',e));
+      pintarRendEstado(false,{enviada:true,procesada:false});
+      vigilarRecepcion(repEnv,turnoEnv,tsEnvio,()=>pdfListo);
+      generarYSubirPDF(snapshot,S.turno,S.rep).then(()=>{pdfListo=true;pintarRendEstado(true,{enviada:true,procesada:false});}).catch(e=>console.warn('PDF bg error:',e));
     }else{
       hideRendBg();
       const msg=(r&&r.message)||'desconocido';
@@ -1606,20 +1615,49 @@ $('cfmYes').addEventListener('click',async()=>{
         }
       }else{
         // Error de red u otro: guardar para reintentar automáticamente
-        try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
+        try{setRendPend(S.rep,S.turno);
             localStorage.setItem(`backup_${fAR()}_${S.turno}`,JSON.stringify(snapshot));}catch(_){}
         toast('Error enviando rendición: '+msg+'. Quedó pendiente, la reintentás al reabrir.',6000);
       }
     }
   }catch(e){
     hideRendBg();
-    try{localStorage.setItem('rendicion_pending',JSON.stringify({rep:S.rep,turno:S.turno,fecha:fAR()}));
+    try{setRendPend(S.rep,S.turno);
         localStorage.setItem(backupKey,JSON.stringify(snapshot));}catch(_){}
     toast('📴 Sin señal. La rendición se enviará automáticamente cuando vuelva internet.',6000);
   }
 });
 
 // ═══════════════════ RENDICIÓN OVERLAY ══════════════════
+/* Cuatro estados distintos: PDF generado · enviada al servidor · recibida por Caja · procesada. Solo el último cierra el circuito. */
+let rendVig=null;
+async function consultarRecepcion(rep,turno,desde){
+  try{
+    let filas;
+    if(RepCred.activa()){const r=await RepCred.rendicionHecha({rep,turno,ts:desde,fecha:fAR()});if(!r.ok)return{error:true};filas=await r.json();}
+    else{const r=await fetch(SB_URL+'/rest/v1/rendiciones_reparto?repartidor=eq.'+encodeURIComponent(rep)+'&turno=eq.'+encodeURIComponent(turno)+'&enviado_at=gte.'+encodeURIComponent(desde)+'&select=id,fecha,enviado_at,procesado&order=enviado_at.desc',{headers:{apikey:SB_ANON,Authorization:'Bearer '+SB_ANON},signal:AbortSignal.timeout(5000)});if(!r.ok)return{error:true};filas=await r.json();}
+    if(!Array.isArray(filas)||!filas.length)return{enviada:false,procesada:false};
+    return{enviada:true,procesada:filas.every(x=>x.procesado===true),fecha:filas[0].fecha};
+  }catch(e){return{error:true};}
+}
+function pintarRendEstado(pdf,e){
+  const el=$('rendEstado');if(!el)return;
+  el.innerHTML='📄 Resumen en PDF: '+(pdf?'generado ✔':'generándose…')+'<br>📤 Enviada al servidor: '+(e&&e.enviada?'✔':(e&&e.error?'no se pudo comprobar':'…'))
+    +'<br>🏦 Caja: '+(e&&e.procesada?'<b>recibida y procesada ✔</b>':(e&&e.enviada?'⏳ esperando que la reciba (te sigo avisando)':'…'));
+}
+function vigilarRecepcion(rep,turno,desde,pdfOk){
+  clearInterval(rendVig);let n=0;
+  const paso=async()=>{const e=await consultarRecepcion(rep,turno,desde);pintarRendEstado(pdfOk(),e);if((e&&e.procesada)||++n>90)clearInterval(rendVig);};
+  try{localStorage.setItem('rend_ultima',JSON.stringify({rep,turno,ts:desde}));}catch(_){}
+  paso();rendVig=setInterval(paso,20000);
+}
+async function rendUltimaAviso(){
+  let u=null;try{u=JSON.parse(localStorage.getItem('rend_ultima')||'null');}catch(_){}
+  if(!u||localStorage.getItem('rendicion_pending'))return;
+  const e=await consultarRecepcion(u.rep,u.turno,u.ts);
+  if(e&&e.enviada&&e.procesada){try{localStorage.removeItem('rend_ultima');}catch(_){}}
+  else if(e&&e.enviada)toast('⏳ Tu rendición del turno '+u.turno+' llegó al servidor pero Caja todavía no la recibió.',7000);
+}
 function showRendBg(){
   $('rendPhase1').style.display='';$('rendPhase2').style.display='none';
   $('rendCopiloto').style.display='none';$('rendActions').style.display='none';
@@ -1643,10 +1681,11 @@ function cerrarRendFail(){$('rendFailBg').classList.remove('open');}
 // Antes de mostrar el aviso, verifica en Supabase si esa rendición ya se había enviado en realidad
 // (puede pasar que GAS termine de procesarla después de que el celular ya perdió la respuesta por timeout/corte de señal).
 async function checkRendicionPendiente(){
+  rendUltimaAviso();
   const rp=JSON.parse(localStorage.getItem('rendicion_pending')||'null');
   if(!rp)return;
   try{
-    const sb=RepCred.activa()?await RepCred.rendicionHecha(rp):await fetch(SB_URL+'/rest/v1/rendiciones_reparto?fecha=eq.'+rp.fecha+'&turno=eq.'+encodeURIComponent(rp.turno)+'&repartidor=eq.'+encodeURIComponent(rp.rep)+'&select=fecha',
+    const sb=RepCred.activa()?await RepCred.rendicionHecha(rp):await fetch(SB_URL+'/rest/v1/rendiciones_reparto?'+(rp.ts?'enviado_at=gte.'+encodeURIComponent(rp.ts):'fecha=eq.'+rp.fecha)+'&turno=eq.'+encodeURIComponent(rp.turno)+'&repartidor=eq.'+encodeURIComponent(rp.rep)+'&select=fecha',
       {headers:{'apikey':SB_ANON,'Authorization':'Bearer '+SB_ANON},signal:AbortSignal.timeout(4000)});
     if(sb.ok){
       const d=await sb.json();
@@ -2983,7 +3022,7 @@ window.openModal=openModal;window.uOrd=uOrd;
     const rq = JSON.parse(localStorage.getItem("rq") || "[]"), pq = JSON.parse(localStorage.getItem("pq") || "[]");
     if (rq.length || pq.length) {
       if (!navigator.onLine) {
-        try { localStorage.setItem("rendicion_pending", JSON.stringify({ rep: s.rep, turno: s.turno, fecha: fAR() })); localStorage.setItem("backup_" + fAR() + "_" + s.turno, JSON.stringify(s.peds)); } catch (e) {}
+        try { setRendPend(s.rep,s.turno); localStorage.setItem("backup_" + fAR() + "_" + s.turno, JSON.stringify(s.peds)); } catch (e) {}
         toast("📴 Rendición de Habituales en cola: se envía sola cuando vuelva internet. Queruclor se rinde después.", 6000); return;
       }
       toast("⏳ Hay datos de Habituales sin sincronizar. Esperá un momento…"); if (typeof fR === "function") fR(); return;
