@@ -1343,6 +1343,8 @@ async function fRUnaVez(){
     for(const item of pq){
       try{const r=await gp({action:'subirComprobante',base64:item.b,numeroCliente:item.n},30000);
         if(r&&r.fileId){uploaded++;const p=S.peds.find(x=>x.numeroCliente===item.n);if(p){p.comprobanteId=r.fileId;push1(p);
+          /* 17/11/2026: si la entrega ya se había confirmado (con la foto todavía pendiente), se reenvía con el comprobante real; sin señal, a la cola de siempre. */
+          if(p.entregado&&!JSON.parse(localStorage.getItem('rq')||'[]').some(x=>x.numeroCliente===item.n)){try{const rr=await gp({action:'guardarDatosReparto',pedidos:[p]});if(window.RepCred&&RepCred.exigirOk)RepCred.exigirOk(rr);}catch(_){qR(p);}}
           // Actualizar comprobanteId real en rq si el pedido estaba encolado con ID temporal
           try{const rq2=JSON.parse(localStorage.getItem('rq')||'[]');const ri=rq2.findIndex(x=>x.numeroCliente===item.n);if(ri>=0){rq2[ri].comprobanteId=r.fileId;localStorage.setItem('rq',JSON.stringify(rq2));}}catch(_){}
         }}
