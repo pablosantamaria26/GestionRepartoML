@@ -2559,7 +2559,7 @@ window.openModal=openModal;window.uOrd=uOrd;
       const m = dinero(st.monto);
       if (!(m > 0)) { st.error = "Poné el importe que recibiste."; return pintar(); }
       if (m > falta + 0.009 && !confirm("Recibiste " + pesos(m) + " y faltaban " + pesos(falta) + ". La diferencia queda a favor del cliente. ¿Es correcto?")) return;
-      if (st.forma === "Transferencia" && !st.foto && !confirm("No sacaste la foto del comprobante. Sin foto, Administración tiene que confirmar la transferencia en el banco. ¿Registrar igual?")) return;
+      if (st.forma === "Transferencia" && !st.foto) { st.error = "Sacá la foto del comprobante de la transferencia: es obligatoria para registrarla."; return pintar(); }
       st.ocupado = true; pintar();
       const r = await ejecutarAsync({ id: OP, tipo: "agregar_pago", ent: ent.id, cliente: ent.cliente_nombre,
         payload: { id: ent.id, op: OP, pago: { forma: st.forma.toLowerCase(), importe: m }, quien: quienRep(), fecha_cobro: new Date().toISOString() } });
@@ -2790,7 +2790,7 @@ window.openModal=openModal;window.uOrd=uOrd;
             (st.forma !== "Efectivo" ? '<input class="qrsh-txt" id="qrRef" maxlength="80" value="' + esc(st.ref) + '" placeholder="' + (st.forma === "Cheque" ? "Banco y número del cheque (opcional)" : "Referencia de la transferencia (opcional)") + '">' : '') +
             fotoHTML() + segundoHTML() + '<div class="qrsh-calc">Cobro ' + pesos(montoN) + ' · queda pendiente ' + pesos(Math.max(0, total - montoN)) +
               (montoN > total ? ' · pagó de más: ' + pesos(montoN - total) + ' queda a favor del cliente' : '') + '</div>' +
-            (st.forma === "Transferencia" ? '<div class="qrsh-nota">Con la foto del comprobante queda verificada; sin foto la confirma Administración en el banco. No suma al efectivo.</div>' : '') : '');
+            (st.forma === "Transferencia" ? '<div class="qrsh-nota">La foto del comprobante es obligatoria: con ella queda verificada. No suma al efectivo.</div>' : '') : '');
       }
       const listo1 = st.paso === 1 && st.resultado && (st.resultado === "visita" ? !!st.motivo : !(necesitaDetalle() && detalleErr) && !(st.resultado === "parte" && !itemsRechazo(false).length));
       sh.innerHTML = cab + '<div class="qrsh-cuerpo">' + cuerpo + '</div>' +
@@ -2873,7 +2873,7 @@ window.openModal=openModal;window.uOrd=uOrd;
       if (st.forma && st.forma !== "No pagó" && !(monto > 0)) { st.error = "Poné el importe que recibiste, o tocá «Pagó todo»."; return pintar(); }
       if (st.p2 && !(monto2 > 0)) { st.error = "Poné el importe del segundo pago, o tocá «Quitar»."; return pintar(); }
       if (st.p2 && st.p2.forma === st.forma) { st.error = "Los dos pagos tienen que ser de formas distintas."; return pintar(); }
-      if (hayTransf() && !st.foto && !confirm("No sacaste la foto del comprobante de la transferencia. Sin foto, Administración tiene que confirmarla en el banco. ¿Registrar igual?")) return;
+      if (hayTransf() && !st.foto) { st.error = "Sacá la foto del comprobante de la transferencia: es obligatoria para registrarla."; return pintar(); }
       if (st.forma && st.forma !== "No pagó" && totalPag > aCobrar() + 0.009 &&
         !confirm("Cobró " + pesos(totalPag) + " y había que cobrar " + pesos(aCobrar()) + ". La diferencia queda a favor del cliente. ¿Es correcto?")) return;
       let items = null;
