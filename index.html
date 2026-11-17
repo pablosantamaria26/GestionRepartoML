@@ -2512,8 +2512,11 @@ window.openModal=openModal;window.uOrd=uOrd;
     if (enviar) ejecutarAsync(op, 1500).then(() => {}, () => {});
   }
   const FORMAS_PAGO = ["Efectivo", "Transferencia", "Cheque"];
-  const fotoBtn = (foto) => '<label class="qrsh-foto' + (foto ? " ok" : "") + '"><input type="file" accept="image/*" capture="environment" data-foto="1" hidden>' +
-    (foto ? "✓ Foto del comprobante lista · tocá para cambiarla" : "📷 Foto del comprobante de la transferencia") + '</label>';
+  /* Dos entradas, como Habituales: sacar la foto o elegirla de la galería (muchas veces se registra sentado en la camioneta). */
+  const fotoBtn = (foto) => '<div class="qrsh-fotos">' +
+    '<label class="qrsh-foto"><input type="file" accept="image/*" capture="environment" data-foto="cam" hidden>📷 Sacar foto</label>' +
+    '<label class="qrsh-foto"><input type="file" accept="image/*" data-foto="gal" hidden>🖼 Elegir de la galería</label>' +
+    (foto ? '<div class="qrsh-foto-ok">✓ Foto del comprobante lista · podés cambiarla</div>' : '<div class="qrsh-foto-nota">Comprobante de la transferencia · obligatorio</div>') + '</div>';
   function engancharFotos(sh, st, repintar) {
     sh.querySelectorAll("[data-foto]").forEach(i => {
       i.onchange = async () => {
@@ -3051,7 +3054,11 @@ window.openModal=openModal;window.uOrd=uOrd;
     .qrsh-add2{ width:100%; margin-top:10px }
     .qrsh-fotoc{ margin-top:10px }
     .qrsh-foto{ display:flex; align-items:center; justify-content:center; text-align:center; min-height:54px; padding:8px 12px; border:2px solid #2563eb; border-radius:12px; background:#eff6ff; color:#1e3a8a; font-weight:800; font-size:14px; cursor:pointer }
-    .qrsh-foto.ok{ border-color:#16a34a; background:#f0fdf4; color:#14532d }
+    .qrsh-fotos{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px }
+    .qrsh-fotos .qrsh-foto{ padding:8px 6px; font-size:13.5px }
+    .qrsh-foto-ok, .qrsh-foto-nota{ grid-column:1 / -1; font-size:13px; font-weight:800; text-align:center; padding:6px 8px; border-radius:10px }
+    .qrsh-foto-ok{ background:#f0fdf4; color:#14532d; border:2px solid #16a34a }
+    .qrsh-foto-nota{ color:#1e3a8a }
     .qrsh-foto:focus-within{ outline:3px solid #2563eb; outline-offset:2px }
     .qrresto{ margin-top:8px; width:100%; min-height:46px; border:0; border-radius:10px; background:#b45309; color:#fff; font:inherit; font-weight:900; font-size:15px; cursor:pointer }
     .qrsh-link{ background:none; border:0; color:#1d4ed8; font:inherit; font-size:13px; font-weight:800; text-decoration:underline; cursor:pointer; padding:4px }
