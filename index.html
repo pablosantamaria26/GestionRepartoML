@@ -1150,7 +1150,7 @@ async function startApp(){
                'Authorization':'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdqZXl2Ymlkb214em9mY2R5Y3lhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMyMjc5MzAsImV4cCI6MjA4ODgwMzkzMH0.B1mg_CNsl7Gx-MdTsXSqkUDPJwvpNiek7-lf_LeaeL4'}});
     if(_sb.ok){const _d=await _sb.json();
       if(_d.length&&Array.isArray(_d[0].pedidos)&&_d[0].pedidos.length>0){
-        S.peds=_d[0].pedidos;await pushA();cL();render();hLoad();ok=true;toast('⚡ Cargado');
+        S.peds=_d[0].pedidos.map(p=>{const q=Object.assign({},p);if(q.importeHab!=null&&Number(q.queruclor)>0)q.importeTotal=Number(q.importeHab);return q;});await pushA();cL();render();hLoad();ok=true;toast('⚡ Cargado');
       }
     }
   }catch(_){}}
@@ -1396,6 +1396,29 @@ setInterval(()=>{
   if(hasQ||hasPQ||hasRP)fR();
 },30000);
 
+/* 17/11/2026 · Completa en las filas ya abiertas el vínculo con Queruclor (pedido, remito, importe de Queruclor) y el importe de
+   Habituales que la oficina agregó DESPUÉS de abrir el día. Nunca toca lo registrado (entregado, pagos, comprobante, visita)
+   ni el importe de una fila ya entregada. Devuelve los nombres de las filas completadas. */
+function completarVinculos(servidor){
+  const hechos=[];if(!Array.isArray(servidor))return hechos;
+  servidor.forEach(sr=>{
+    if(!sr||sr.numeroCliente==null)return;
+    const p=S.peds.find(x=>String(x.numeroCliente)===String(sr.numeroCliente));if(!p)return;
+    if(!sr.pedidoId&&!(Number(sr.queruclor)>0))return;
+    const yaTenia=!!p.pedidoId||(Array.isArray(p.remitos)&&p.remitos.length>0);
+    let cambio=false;
+    ['pedidoId','remitos','remito','queruclor','soloQueruclor','importeML'].forEach(k=>{
+      if(sr[k]==null)return;
+      if(JSON.stringify(p[k])!==JSON.stringify(sr[k])){p[k]=sr[k];cambio=true;}
+    });
+    /* El importe de Habituales: solo si la fila todavía no tiene nada registrado. */
+    if(sr.importeHab!=null&&!p.entregado&&!p.visita&&!(Number(p.importePagado1)>0)&&Number(p.importeTotal)!==Number(sr.importeHab)){p.importeTotal=Number(sr.importeHab);cambio=true;}
+    if(cambio&&!yaTenia)hechos.push(p.nombre||('Cliente '+p.numeroCliente));
+    else if(cambio)hechos.push(p.nombre||('Cliente '+p.numeroCliente));
+  });
+  return hechos;
+}
+
 // ═══════════ CLIENTES QUE LA OFICINA SUMA DESPUÉS ════════════
 // La lista del turno se baja una vez (y queda en Firebase). Si la oficina
 // agrega clientes después, solo aparecían al «Enviar rendición». Ahora se
@@ -1412,6 +1435,8 @@ async function sumarNuevosOficina(){
     const d=await sb.json();
     if(!d.length||!Array.isArray(d[0].pedidos)||S.lk||S.sav)return;
     const loc=new Set(S.peds.map(p=>String(p.numeroCliente)));
+    const completados=completarVinculos(d[0].pedidos);
+    if(completados.length){await pushA();cL();render();try{if(window.QRReparto)QRReparto.refrescar();}catch(_){}toast('🧴 La oficina vinculó Queruclor a: '+completados.join(', '),7000);}
     const nuevos=d[0].pedidos.filter(p=>p&&p.numeroCliente!=null&&String(p.numeroCliente).trim()&&!loc.has(String(p.numeroCliente)));
     if(!nuevos.length)return;
     S.peds=[...S.peds,...nuevos];
@@ -2353,6 +2378,36 @@ window.openModal=openModal;window.uOrd=uOrd;
       (e.estado === "pendiente" || !e.rendicion));
   }
 
+  /* 17/11/2026 · Un remito de Queruclor PENDIENTE de un cliente de esta ruta que la oficina no incluyó (el otro pedido del cliente).
+     Nunca se suma solo: se muestra con un botón que pide confirmación. Un remito que volvió sin entregar (ya tuvo recorrido) no cuenta. */
+  const avisados = new Set();
+  function pendienteFueraDeRuta(num) {
+    const n = soloNums(num); if (!n) return null;
+    const vin = vinculados(), rec = recorridoId();
+    return todas().find(e => soloNums(e.cliente_id) === n && e.estado === "pendiente" && !e.rendicion && !e.recorrido && !vin.has(String(e.remito)) && !(rec && e.recorrido === rec)) || null;
+  }
+  function pintarAvisoFuera(card, num) {
+    const e = pendienteFueraDeRuta(num);
+    let av = card.querySelector(".qralerta");
+    if (!e) { if (av) av.remove(); return; }
+    const clave = e.remito + "|" + (Number(e.total) || 0) + "|" + (e.bultos || 0);
+    if (av && av.dataset.clave === clave) return;
+    if (!av) { av = document.createElement("div"); av.className = "qralerta"; av.setAttribute("role", "alert"); card.appendChild(av); }
+    av.dataset.clave = clave;
+    av.innerHTML = '<div class="qra-t">🧴 QUERUCLOR sin cargar en tu ruta</div><div class="qra-d">Remito ' + esc(e.remito) + ' · ' + pesos(e.total) + ' · ' + (e.bultos || 0) + ' caja(s). La oficina cargó a este cliente pero no incluyó este pedido.</div>' +
+      '<button type="button" class="qra-b">Sumar a mi ruta</button>';
+    av.querySelector(".qra-b").onclick = ev => { ev.stopPropagation(); sumarARuta(e); };
+    av.onclick = ev => ev.stopPropagation();
+    if (!avisados.has(e.remito)) { avisados.add(e.remito); if (window.toast) toast("⚠️ " + ((pedidoDe(num) || {}).nombre || "Un cliente") + " tiene Queruclor pendiente que no está en tu ruta", 7000); }
+  }
+  function sumarARuta(e) {
+    const s = app(); if (!s || !s.turno || !s.rep) return;
+    if (!confirm("¿Sumar a tu ruta el remito " + e.remito + " de Queruclor (" + pesos(e.total) + ", " + (e.bultos || 0) + " caja(s))?\n\nQueda para entregar y cobrar hoy.")) return;
+    QRSrv.rpcAsync("qr_recorrido_asignar", { o: { fecha: hoyLocal(), turno: s.turno, repartidor: s.rep, remitos: [e.remito] } }).then(r => {
+      if (r && r.ok) { invalidar(); if (window.toast) toast("✅ Queruclor sumado a tu ruta", 4000); } else if (window.toast) toast((r && r.motivo) || "No se pudo sumar", 6000, "error");
+    }, () => { if (window.toast) toast("Sin señal: no se sumó. Probá de nuevo.", 6000); });
+  }
+
   /* ── La tarjeta ───────────────────────────────────────────────── */
   const RES = { local_cerrado: "Local cerrado", no_llegue: "No llegué" };
   function etiquetaDe(ent) {
@@ -2367,7 +2422,8 @@ window.openModal=openModal;window.uOrd=uOrd;
     document.querySelectorAll(".card").forEach(card => {
       const num = soloNums((card.querySelector(".cnu") || {}).textContent);
       const ent = entregaDe(num);
-      if (!ent) { card.classList.remove("qr-dual"); return; }
+      if (!ent) { card.classList.remove("qr-dual"); try { pintarAvisoFuera(card, num); } catch (e) {} return; }
+      { const av0 = card.querySelector(".qralerta"); if (av0) av0.remove(); }
       const ped = pedidoDe(num);
       const est = estadoDoc(ent);
       const montoQ = ent.estado === "pendiente" ? aPagarRapido(ent) : ent.total;
@@ -2780,6 +2836,10 @@ window.openModal=openModal;window.uOrd=uOrd;
     .qrml .qrln-k{ color:var(--mlc) } .qrqr .qrln-k{ color:var(--qr) }
     .qrln-r{ font-size:10.5px; color:var(--tx3,#6b7280); font-family:var(--m,monospace) }
     .qrln-s{ font-size:11px; font-weight:700; color:var(--wn,#a16207); margin-top:1px }
+    .qralerta{ margin:10px 0 0; padding:10px 12px; border-radius:12px; background:#fffbeb; border:2px solid #f59e0b; color:#78350f }
+    .qra-t{ font-weight:900; font-size:13.5px; margin-bottom:3px } .qra-d{ font-size:12.5px; line-height:1.35 }
+    .qra-b{ margin-top:8px; width:100%; min-height:46px; border:0; border-radius:10px; background:#b45309; color:#fff; font:inherit; font-weight:900; font-size:15px; cursor:pointer }
+    .qra-b:focus-visible{ outline:3px solid #2563eb; outline-offset:2px }
     .qrln-f{ display:flex; align-items:center; gap:8px; margin-top:4px; font-size:11.5px; color:var(--tx2,#4b5563); flex-wrap:wrap }
     .qrln-go{ margin-left:auto; font-weight:800 }
     .qrml .qrln-go{ color:var(--mlc) } .qrqr .qrln-go{ color:var(--qr) }

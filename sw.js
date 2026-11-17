@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reparto-ml-v23';
+const CACHE_NAME = 'reparto-ml-v24';
 const STATIC_ASSETS = [
   './',
   './index.html',
