@@ -316,8 +316,25 @@
     if (x.status >= 400) throw new Error((datos && (datos.message || datos.error)) || ("error " + x.status));
     return datos;
   }
+  /* 17/11/2026: pedido asíncrono con el mismo token y los mismos errores que xhr(). */
+  function pedirAsync(metodo, url, cuerpo) {
+    var h = conToken({ "Content-Type": "application/json" }); if (GEN) h["X-QR-Gen"] = GEN;
+    return _fetch(ORIGEN + url, { method: metodo, headers: h, body: cuerpo === undefined ? undefined : JSON.stringify(cuerpo), cache: "no-store" }).then(function (x) {
+      vigilarToken(x.status);
+      if (x.status === 0 || x.status >= 500) { marcar(true); throw new Error("El servidor no respondió (" + x.status + ")."); }
+      marcar(false);
+      return x.text().then(function (txt) { var d = null; try { d = txt ? JSON.parse(txt) : null; } catch (e) {}
+        if (x.status === 409 && d && d.generacion_vieja) avisoGeneracion();
+        if (x.status >= 400) throw new Error((d && (d.message || d.error)) || ("error " + x.status));
+        if (metodo !== "GET") cache = {};
+        return d; });
+    }, function () { marcar(true); throw new Error("Sin conexión con el servidor."); });
+  }
   var cache = {};
   window.QRSrv = {
+    /* 17/11/2026: las mismas llamadas SIN trabar el teléfono (mismo token, generación y errores). */
+    rpcAsync: function (fn, args) { return pedirAsync("POST", "/rest/v1/rpc/" + fn, args || {}); },
+    getAsync: function (tabla, qs) { return pedirAsync("GET", "/rest/v1/" + tabla + (qs ? "?" + qs : "")); },
     rpc: function (fn, args) { var r = xhr("POST", "/rest/v1/rpc/" + fn, args || {}); cache = {}; return r; },
     /* Lecturas con memoria corta: una pantalla pregunta el stock de cada
        tarjeta varias veces por dibujo; con esto es una sola consulta. */
@@ -1188,7 +1205,7 @@ function render(){
     const ri=S.peds.indexOf(p),tp=(Number(p.importePagado1)||0)+(Number(p.importePagado2)||0),np=p.entregado&&!p.devolucion&&tp===0;
     let cl='card';if(p.entregado)cl+=' done';if(p.devolucion)cl+=' dev';if(np)cl+=' nopay';
     let bd='';if(p.entregado)bd+='<span class="b b-ok">✅ Entregado</span>';else bd+='<span class="b b-p">Pendiente</span>';
-    if(p.devolucion)bd+='<span class="b b-d">⚠️ Devolución</span>';if(np)bd+='<span class="b b-np">🔴 Sin pago</span>';if(p.comprobanteId)bd+='<span class="b b-ph">📷</span>';
+    if(p.devolucion)bd+='<span class="b b-d">⚠️ Devolución</span>';if(np)bd+='<span class="b b-np">🔴 Sin pago</span>';if(p.comprobanteId)bd+=String(p.comprobanteId).indexOf('pending_')===0?'<span class="b b-ph">📷 Pendiente de envío</span>':'<span class="b b-ph">📷 Enviada</span>';
     return`<div class="${cl}" data-ri="${ri}" draggable="false"><div class="ct"><span class="cnu">Nº ${p.numeroCliente||''}</span><input type="number" class="cord" value="${p.orden||''}" ${p.entregado?'disabled':''} onclick="event.stopPropagation()" onchange="uOrd(${ri},this.value)" onfocus="if(!this.dataset.r){this.blur();this.dataset.r='1';}" onblur="this.dataset.r=''" title="Tocá dos veces para editar el orden" min="1"/></div><div class="cn">${p.nombre||''}</div><div class="c-amt">$${mn(p.importeTotal)}</div><div class="ca">📍 ${p.domicilio||''}, ${p.localidad||''}</div><div class="cbs">${bd}</div><div class="drag-handle" data-dh="1">⠿</div></div>`;
   }).join('');
   c.querySelectorAll('.card').forEach(el=>{el.addEventListener('click',e=>{if(e.target.closest('.drag-handle')||e.target.tagName==='INPUT')return;openModal(+el.dataset.ri);});});
@@ -1308,7 +1325,11 @@ async function confirmDel(){
 // ═══════════════════ OFFLINE QUEUE ═══════════════════
 function qR(p){try{const q=JSON.parse(localStorage.getItem('rq')||'[]');q.push({...p,_queuedAt:Date.now()});localStorage.setItem('rq',JSON.stringify(q));toast('💾 Guardado offline, se subirá automáticamente');uSyncBadge();}catch(_){}}
 
+let _fRCorriendo=false;
 async function fR(){
+  if(_fRCorriendo)return;_fRCorriendo=true;try{await fRUnaVez();}finally{_fRCorriendo=false;}
+}
+async function fRUnaVez(){
   // Flush pedidos queue
   const q=JSON.parse(localStorage.getItem('rq')||'[]');
   if(q.length>0){
@@ -1410,7 +1431,19 @@ function encolarFotoPendiente_(p,f){
     r2.readAsDataURL(f);
   }catch(_){}
 }
-async function hPhoto(f){if(!f||S.mi<0)return;const p=S.peds[S.mi];sLoad('Comprimiendo...');
+/* 17/11/2026: la foto se guarda comprimida en el teléfono («Pendiente de envío») y se sube en segundo plano por la
+   cola de siempre: Nico sigue con la parada siguiente. «Enviada» recién cuando el servidor devuelve el archivo. */
+async function hPhoto(f){if(!f||S.mi<0)return;const p=S.peds[S.mi];
+  let b;try{b=RepCred.recordarFoto(f,await compImg(f));}catch(_){toast('No se pudo leer la foto: probá de nuevo');return;}
+  try{
+    if(!p.comprobanteId||String(p.comprobanteId).indexOf('pending_')===0){p.comprobanteId='pending_'+p.numeroCliente;}
+    const q=JSON.parse(localStorage.getItem('pq')||'[]').filter(x=>x.n!==p.numeroCliente);q.push({b,n:p.numeroCliente,t:Date.now()});
+    localStorage.setItem('pq',JSON.stringify(q));cL();render();uSyncBadge();
+    toast('📷 Foto guardada en el teléfono · enviando…');
+    setTimeout(()=>fR(),50);
+  }catch(_){toast('⚠️ No se pudo guardar la foto en el teléfono: probá de nuevo',6000);}
+}
+async function hPhotoViejo(f){if(!f||S.mi<0)return;const p=S.peds[S.mi];sLoad('Comprimiendo...');
   try{
     const b=RepCred.recordarFoto(f,await compImg(f));sLoad('Subiendo...');
     const r=await gp({action:'subirComprobante',base64:b,numeroCliente:p.numeroCliente},30000);
@@ -2140,14 +2173,43 @@ window.openModal=openModal;window.uOrd=uOrd;
   const pesos = n => "$" + mn(n);
   const dinero = n => Math.round((Number(n) || 0) * 100) / 100;
 
-  let cacheEnt = null, cacheEn = 0;
+  /* 17/11/2026: las entregas se traen EN SEGUNDO PLANO y se recuerdan (cada 30 s como máximo, solo con la pantalla a la
+     vista). Antes se releía la tabla entera cada 2,5 s con el teléfono congelado. La pantalla dibuja con lo que tiene. */
+  let cacheEnt = null, cacheEn = 0, trayendo = null;
+  function traerEntregas() {
+    if (trayendo || !window.QRSrv || !QRSrv.getAsync) return trayendo;
+    trayendo = QRSrv.getAsync("qr_entregas", "rendicion=is.null&order=seq.asc")   /* solo lo que el recorrido usa (sin rendir), no todo el historial */.then(l => {
+      cacheEnt = Array.isArray(l) ? l : (cacheEnt || []); cacheEn = Date.now(); trayendo = null;
+      try { pintarTarjetas(); asignarRecorrido(); } catch (e) {}
+      if (window.qrUnificadoRefrescar) try { qrUnificadoRefrescar(); } catch (e) {}
+      return cacheEnt;
+    }, () => { trayendo = null; return cacheEnt; });
+    return trayendo;
+  }
   const todas = () => {
     if (!window.Reparto) return [];
-    if (cacheEnt && Date.now() - cacheEn < 800) return cacheEnt;
-    try { cacheEnt = Reparto.entregas(); cacheEn = Date.now(); } catch (e) { cacheEnt = cacheEnt || []; }
-    return cacheEnt;
+    if (!cacheEnt || (Date.now() - cacheEn > 30000 && !document.hidden)) traerEntregas();
+    return cacheEnt || [];
   };
-  const invalidar = () => { cacheEnt = null; };
+  const invalidar = () => { cacheEn = 0; traerEntregas(); };
+  /* Lo que se acaba de guardar se ve enseguida, sin esperar la próxima lectura. */
+  function aplicarLocal(entId, cambios) { const e = (cacheEnt || []).find(x => x.id === entId); if (e) Object.assign(e, cambios); }
+  /* «A cobrar» de cada remito: en segundo plano y recordado 60 s (antes: una consulta trabada por parada en cada redibujo). */
+  const aCobrarCache = {};
+  function aPagarRapido(ent) {
+    if (ent.estado !== "pendiente" && ent.cobrado != null) return dinero(ent.cobrado);
+    /* Plan Free: se pide UNA vez por remito y solo se repite si cambia la entrega (estado, total o saldo anterior). */
+    const c = aCobrarCache[ent.remito], k = ent.estado + "|" + (ent.total || 0) + "|" + (ent.saldo_anterior || 0);
+    if ((!c || c.k !== k) && !(c && c.pidiendo) && window.QRSrv && QRSrv.rpcAsync) {
+      aCobrarCache[ent.remito] = Object.assign(c || { v: null, t: 0 }, { pidiendo: true, k });
+      QRSrv.rpcAsync("qr_a_cobrar_entrega", { p_remito: ent.remito }).then(r => {
+        aCobrarCache[ent.remito] = { v: r && r.a_cobrar != null ? dinero(r.a_cobrar) : null, t: Date.now(), k };
+        try { pintarTarjetas(); } catch (e) {}
+      }, () => { aCobrarCache[ent.remito].pidiendo = false; });
+    }
+    return c && c.v != null ? c.v : dinero((Number(ent.total) || 0) + (Number(ent.saldo_anterior) || 0));
+  }
+  const olvidarACobrar = remito => { delete aCobrarCache[remito]; };
   const soloNums = s => String(s || "").replace(/[^\d]/g, "");
   const enLinea = () => !!(window.QR_LOCAL && window.QRSrv);
 
@@ -2211,20 +2273,44 @@ window.openModal=openModal;window.uOrd=uOrd;
   }
   /* Reintenta en orden. Una operación que la base rechaza (no por falta de
      conexión) sale de la cola y queda el aviso para revisarla. */
-  function sincronizar() {
-    const l = leerCola();
-    if (!l.length || !enLinea()) return { pendientes: l.length };
-    const quedan = [];
-    for (let i = 0; i < l.length; i++) {
-      let r;
-      try { r = correr(l[i]); }
-      catch (e) { quedan.push(...l.slice(i)); break; }
-      if (r && r.ok === false) errorSync = (l[i].cliente || "") + ": " + (r.motivo || "la base no lo aceptó");
-    }
-    guardarCola(quedan); invalidar();
-    if (!quedan.length && l.length && window.toast) toast("📤 Queruclor sincronizado");
+  /* 17/11/2026: la misma operación, sin trabar el teléfono. */
+  function correrAsync(op) {
+    if (op.tipo === "registrar") return QRSrv.rpcAsync("qr_registrar_entrega", { o: op.payload }).then(r => { if (!r) throw new Error("sin respuesta"); return { ok: true, r }; });
+    if (op.tipo === "visita") return QRSrv.rpcAsync("qr_visita_registrar", { o: op.payload });
+    if (op.tipo === "dev") return QRSrv.rpcAsync("qr_dev_operar", { o: op.payload });
+    return Promise.reject(new Error("operación desconocida"));
+  }
+  const enVuelo = new Set();
+  /* Guarda en el teléfono PRIMERO (sobrevive a cerrar la app) y envía. Espera la respuesta hasta «espera» ms sin trabar
+     la pantalla: si llega, devuelve lo que dijo la base; si no, queda «Pendiente de envío» y se completa solo. */
+  function ejecutarAsync(op, espera) {
+    const l = leerCola(); if (!l.some(x => x.id === op.id)) { l.push(Object.assign({ creado: new Date().toISOString() }, op)); guardarCola(l); }
+    enVuelo.add(op.id);
+    const envio = correrAsync(op).then(r => { guardarCola(leerCola().filter(x => x.id !== op.id)); enVuelo.delete(op.id); invalidar(); return r; },
+      e => { enVuelo.delete(op.id); throw e; });
+    envio.then(r => { if (r && r.ok === false) errorSync = (op.cliente || "") + ": " + (r.motivo || "la base no lo aceptó"); try { refrescar(); } catch (e) {} }, () => {});
+    return Promise.race([envio, new Promise(res => setTimeout(() => res({ encolada: true, motivo: "sin respuesta todavía" }), espera || 6000))])
+      .catch(e => ({ encolada: true, motivo: e.message }));
+  }
+  let sincronizando = false;
+  async function sincronizar() {
+    const l = leerCola().filter(x => !enVuelo.has(x.id));
+    if (!l.length || !enLinea() || sincronizando) return { pendientes: leerCola().length };
+    sincronizando = true;
+    try {
+      for (const op of l) {
+        let r;
+        enVuelo.add(op.id);
+        try { r = await correrAsync(op); } catch (e) { enVuelo.delete(op.id); break; }
+        enVuelo.delete(op.id);
+        guardarCola(leerCola().filter(x => x.id !== op.id));
+        if (r && r.ok === false) errorSync = (op.cliente || "") + ": " + (r.motivo || "la base no lo aceptó");
+      }
+    } finally { sincronizando = false; }
+    invalidar();
+    if (!leerCola().length && l.length && window.toast) toast("📤 Queruclor enviado");
     try { refrescar(); } catch (e) {}
-    return { pendientes: quedan.length };
+    return { pendientes: leerCola().length };
   }
   setInterval(() => { if (navigator.onLine && leerCola().length) sincronizar(); }, 15000);
   window.addEventListener("online", () => setTimeout(sincronizar, 500));
@@ -2233,7 +2319,7 @@ window.openModal=openModal;window.uOrd=uOrd;
   /* ── El recorrido (fecha + turno + repartidor) ────────────────── */
   const hoyLocal = () => { const d = new Date(); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); };
   function recorridoId() { const s = app(); return s && s.turno && s.rep ? hoyLocal() + "|" + s.turno + "|" + String(s.rep).toUpperCase() : null; }
-  let _asignados = "";
+  let _asignados = "", _asignando = "";
   function asignarRecorrido() {
     if (!enLinea()) return;
     const s = app(); if (!s || !s.turno || !s.rep || !Array.isArray(s.peds)) return;
@@ -2241,8 +2327,10 @@ window.openModal=openModal;window.uOrd=uOrd;
     const rems = todas().filter(e => e.estado === "pendiente" && (vin.has(String(e.remito)) || (porCliente() && clientes.has(soloNums(e.cliente_id))))).map(e => e.remito).sort();
     const firma = recorridoId() + ":" + rems.join(",");
     if (!rems.length || firma === _asignados) return;
-    try { const r = QRSrv.rpc("qr_recorrido_asignar", { o: { fecha: hoyLocal(), turno: s.turno, repartidor: s.rep, remitos: rems } }); if (r && r.ok) { _asignados = firma; invalidar(); } }
-    catch (e) { /* sin señal: se reintenta en el próximo refresco */ }
+    if (_asignando === firma) return; _asignando = firma;
+    QRSrv.rpcAsync("qr_recorrido_asignar", { o: { fecha: hoyLocal(), turno: s.turno, repartidor: s.rep, remitos: rems } })
+      .then(r => { if (r && r.ok) { _asignados = firma; invalidar(); } }, () => {})   /* sin señal: se reintenta en el próximo refresco */
+      .then(() => { _asignando = ""; });
   }
 
   /* Estado de un documento de Queruclor para el recorrido de hoy. */
@@ -2267,7 +2355,7 @@ window.openModal=openModal;window.uOrd=uOrd;
   const RES = { local_cerrado: "Local cerrado", no_llegue: "No llegué" };
   function etiquetaDe(ent) {
     const est = estadoDoc(ent);
-    if (est === "cola") return "guardado en el teléfono · falta sincronizar";
+    if (est === "cola") return "⏳ Pendiente de envío · guardado en el teléfono";
     if (est === "visita") return RES[ent.ultima_visita.motivo] + " · reprogramar";
     if (est === "pendiente") return null;
     if (ent.estado === "rechazado") return "rechazó todo";
@@ -2280,7 +2368,8 @@ window.openModal=openModal;window.uOrd=uOrd;
       if (!ent) { card.classList.remove("qr-dual"); return; }
       const ped = pedidoDe(num);
       const est = estadoDoc(ent);
-      const firma = ent.remito + "|" + ent.estado + "|" + est + "|" + (ped && ped.entregado ? "1" : "0") + "|" + (ped && ped.visita ? ped.visita.motivo : "");
+      const montoQ = ent.estado === "pendiente" ? aPagarRapido(ent) : ent.total;
+      const firma = ent.remito + "|" + ent.estado + "|" + est + "|" + (ped && ped.entregado ? "1" : "0") + "|" + (ped && ped.visita ? ped.visita.motivo : "") + "|" + montoQ;
       if (card.dataset.qrFirma === firma) return;
       card.dataset.qrFirma = firma;
       card.classList.add("qr-dual");
@@ -2318,7 +2407,7 @@ window.openModal=openModal;window.uOrd=uOrd;
       qr.classList.toggle("cola", est === "cola");
       qr.innerHTML =
         '<div class="qrln-h"><span class="qrln-k">QUERUCLOR</span><span class="qrln-r">remito ' + esc(ent.remito) + '</span></div>' +
-        '<div class="c-amt">' + pesos(ent.estado === "pendiente" ? Reparto.aPagar(ent) : ent.total) + '</div>' +
+        '<div class="c-amt">' + pesos(montoQ) + '</div>' +
         (ent.saldo_anterior && ent.estado === "pendiente" ? '<div class="qrln-s">incluye saldo anterior de la cuenta: ' + pesos(ent.saldo_anterior) + '</div>' : '') +
         '<div class="qrln-f"><span>' + (ent.bultos || 0) + ' caja(s) · ' + esc(ent.vendedor || "—") + '</span>' +
           (lab ? '<span class="qrln-ok">' + esc(lab) + '</span>' : '<span class="qrln-go">registrar ›</span>') + '</div>';
@@ -2328,9 +2417,9 @@ window.openModal=openModal;window.uOrd=uOrd;
   }
 
   /* ── La hoja de Queruclor: entrega y cobro ────────────────────── */
-  function abrirCobro(entId) {
+  function abrirCobro(entId, reintento) {
     const ent = todas().find(e => e.id === entId);
-    if (!ent) return;
+    if (!ent) { if (!reintento) { cacheEn = 0; const p = traerEntregas(); if (p) p.then(() => abrirCobro(entId, true)); } return; }
     if (ent.estado !== "pendiente") { if (window.toast) toast("Esta entrega ya tiene resultado: " + etiquetaDe(ent)); return; }
     if (enCola(ent.id).length) { if (window.toast) toast("Ya está guardada en el teléfono: falta sincronizar"); return; }
 
@@ -2338,8 +2427,16 @@ window.openModal=openModal;window.uOrd=uOrd;
     const OP = { dev: "rep|dev|" + ent.id + "|" + sufijo, reg: "rep|reg|" + ent.id + "|" + sufijo, vis: "rep|vis|" + ent.id + "|" + sufijo };
     const st = { paso: 1, resultado: null, motivo: null, obs: "", forma: null, monto: "", ref: "", error: "", ocupado: false, cajas: {}, cant: {} };
     let det = null, arts = null, bultos = [], vuelve = 0, vuelveErr = "";
-    try { det = Reparto.detalleCobro(ent); } catch (e) {}
-    const base = () => dinero(det && det.a_cobrar != null ? det.a_cobrar : Reparto.aPagar(ent));
+    /* Con el monto ya conocido la hoja abre al instante y lo confirma en segundo plano (si cambió, se actualiza a la vista). */
+    { const c = aCobrarCache[ent.remito];
+      if (c && c.v != null) {
+        det = { a_cobrar: c.v };
+        QRSrv.rpcAsync("qr_a_cobrar_entrega", { p_remito: ent.remito }).then(r => {
+          if (!r || r.a_cobrar == null) return; const v = dinero(r.a_cobrar); aCobrarCache[ent.remito] = Object.assign({}, c, { v, t: Date.now() });
+          if (v !== dinero(det.a_cobrar)) { det = r; if (st.todo) st.monto = String(aCobrar()); try { pintar(); } catch (e) {} }
+        }, () => {});
+      } else { try { det = Reparto.detalleCobro(ent); if (det && det.a_cobrar != null) aCobrarCache[ent.remito] = { v: dinero(det.a_cobrar), t: Date.now() }; } catch (e) {} } }
+    const base = () => dinero(det && det.a_cobrar != null ? det.a_cobrar : aPagarRapido(ent));
     /* Lo que vuelve con el repartidor no se cobra hoy: se valoriza con la
        misma función que usa la base para «a cobrar» (qr_dev_valor). */
     const aCobrar = () => Math.max(0, dinero(base() - vuelve));
@@ -2565,7 +2662,7 @@ window.openModal=openModal;window.uOrd=uOrd;
     window.qrCobroForma = f => { st.forma = f; if (f === "No pagó") st.monto = ""; pintar(); const m = sh.querySelector("#qrMonto"); if (m) m.focus(); };
     window.qrCobroTodo = () => { st.todo = true; st.monto = String(aCobrar()); pintar(); };
 
-    window.qrCobroGuardar = () => {
+    window.qrCobroGuardar = async () => {
       if (st.ocupado || st.hecho) return;             // doble toque (también después de guardar, mientras la hoja se cierra)
       st.error = "";
       const monto = dinero(st.monto);
@@ -2574,12 +2671,12 @@ window.openModal=openModal;window.uOrd=uOrd;
         if (!st.motivo) { st.error = "Elegí el motivo: Local cerrado o No llegué."; return pintar(); }
         const s = app() || {};
         st.ocupado = true; pintar();
-        const r = ejecutar({ id: OP.vis, tipo: "visita", ent: ent.id, cliente: ent.cliente_nombre,
+        const r = await ejecutarAsync({ id: OP.vis, tipo: "visita", ent: ent.id, cliente: ent.cliente_nombre,
           payload: { op: OP.vis, entrega_id: ent.id, motivo: st.motivo, obs: st.obs, repartidor: s.rep || "", turno: s.turno || "", recorrido: recorridoId() } });
         st.ocupado = false;
         if (r && r.ok === false) { st.error = r.motivo || "No se guardó."; return pintar(); }
         st.hecho = true;
-        if (window.toast) toast(r && r.encolada ? "📴 Sin señal: la visita quedó en el teléfono, se sincroniza sola" : "Visita registrada: " + RES[st.motivo] + " · queda para reprogramar", 5000);
+        if (window.toast) toast(r && r.encolada ? "⏳ Visita guardada en el teléfono · pendiente de envío (se envía sola)" : "✅ Visita enviada: " + RES[st.motivo] + " · queda para reprogramar", 5000);
         return cerrarYSeguir();
       }
       if (st.paso === 1) {
@@ -2600,19 +2697,23 @@ window.openModal=openModal;window.uOrd=uOrd;
       st.ocupado = true; pintar();
       /* 1 · la mercadería que vuelve (devolución pendiente: sin nota, sin stock). */
       if (items && items.length) {
-        const rd = ejecutar({ id: OP.dev, tipo: "dev", ent: ent.id, cliente: ent.cliente_nombre,
+        const rd = await ejecutarAsync({ id: OP.dev, tipo: "dev", ent: ent.id, cliente: ent.cliente_nombre,
           payload: { op: OP.dev, tipo: "alta", pedido_id: String(ent.pedido_id), items, quien: quienRep(), origen: "reparto" } });
         if (rd && rd.ok === false) { st.ocupado = false; st.error = rd.motivo || "No se pudo registrar lo que vuelve."; return pintar(); }
       }
       /* 2 · el resultado y el cobro declarado. */
       const pago = st.forma && st.forma !== "No pagó" ? monto : 0;
       const nota = st.ref ? (st.forma + ": " + st.ref) : "";
-      const rr = ejecutar({ id: OP.reg, tipo: "registrar", ent: ent.id, cliente: ent.cliente_nombre,
+      const rr = await ejecutarAsync({ id: OP.reg, tipo: "registrar", ent: ent.id, cliente: ent.cliente_nombre,
         payload: { id: ent.id, estado: st.resultado === "rechazo" ? "rechazado" : "entregado", rechazado: st.resultado === "rechazo",
           cobrado: pago, forma: pago ? st.forma : "", nota, quien: quienRep(), recorrido: recorridoId(), fecha_cobro: new Date().toISOString() } });
-      st.ocupado = false; st.hecho = true;
+      st.ocupado = false;
+      if (rr && rr.ok === false) { st.error = rr.motivo || "La base no lo aceptó."; return pintar(); }
+      st.hecho = true;
+      if (!(rr && rr.encolada)) aplicarLocal(ent.id, { estado: st.resultado === "rechazo" ? "rechazado" : "entregado", cobrado: pago });
+      olvidarACobrar(ent.remito);
       if (window.vib) vib(80);
-      if (window.toast) toast(rr && rr.encolada ? "📴 Sin señal: quedó guardado en el teléfono y se sincroniza solo (no se duplica)"
+      if (window.toast) toast(rr && rr.encolada ? "⏳ Guardado en el teléfono · pendiente de envío (se envía solo, sin duplicar)"
         : st.resultado === "rechazo" ? "Rechazo registrado: la nota la hace Caja cuando llega la mercadería"
         : pago ? "✅ Queruclor: " + (st.resultado === "parte" ? "entrega parcial" : "entregado") + " · cobró " + pesos(pago) : "✅ Queruclor entregado sin pago", 4500);
       cerrarYSeguir();
@@ -2990,7 +3091,7 @@ window.openModal=openModal;window.uOrd=uOrd;
   async function sendRend() {
     const s = app(); if (!s || s.lk) return;
     const q = QRR();
-    if (q && q.leerCola().length) q.sincronizar();
+    if (q && q.leerCola().length) await q.sincronizar();   // 17/11/2026: ahora es asíncrona
     const k = conteo();
     if (k.sin.length) {
       modal(`<h3>Falta registrar ${k.sin.length} entrega${k.sin.length === 1 ? "" : "s"}</h3>
@@ -3068,17 +3169,20 @@ window.openModal=openModal;window.uOrd=uOrd;
     if (window.RepartoML && foto.pedidos.length) { try { const ml = RepartoML.guardarRendicion(foto); foto.ml_ref = ml && ml.id; } catch (e) { console.warn("[ml]", e); } }
     rendirQueruclor(foto);
   }
-  function rendirQueruclor(foto) {
-    if (!window.Reparto) return;
+  /* 17/11/2026: la rendición de Queruclor se envía sin trabar el teléfono; un solo envío a la vez (el reintento no duplica). */
+  let rindiendoQr = false;
+  async function rendirQueruclor(foto) {
+    if (!window.Reparto || rindiendoQr) return;
+    rindiendoQr = true;
     try {
-      const rend = Reparto.rendir({ quien: foto.repartidor, repartidor: foto.repartidor, turno: foto.turno, recorrido: foto.recorrido, ml_ref: foto.ml_ref || null });
+      const rend = await QRSrv.rpcAsync("qr_rendir", { o: { quien: foto.repartidor, repartidor: foto.repartidor, turno: foto.turno, recorrido: foto.recorrido, ml_ref: foto.ml_ref || null } });
       localStorage.removeItem("qr_rend_pendiente_v1");
       if (rend && foto.ml_ref && window.RepartoML) { try { RepartoML.vincular(foto.ml_ref, rend.id); } catch (e) {} }
       if (window.toast) toast(rend ? "Queruclor rendido: " + pesos(rend.total) + " declarados" : "Queruclor: nada cobrado para rendir (el recorrido quedó cerrado)", 5000);
     } catch (e) {
       try { localStorage.setItem("qr_rend_pendiente_v1", JSON.stringify(foto)); } catch (x) {}
       if (window.toast) toast("📴 Queruclor no se rindió (sin conexión): se reintenta solo, sin duplicar.", 7000);
-    }
+    } finally { rindiendoQr = false; }
   }
   setInterval(() => { const p = localStorage.getItem("qr_rend_pendiente_v1"); if (p && navigator.onLine) { try { rendirQueruclor(JSON.parse(p)); } catch (e) {} } }, 20000);
 
