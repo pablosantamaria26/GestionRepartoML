@@ -2296,6 +2296,8 @@ window.openModal=openModal;window.uOrd=uOrd;
     if (op.tipo === "registrar") { const r = Reparto.registrar(op.payload); if (!r) throw new Error("sin respuesta"); return { ok: true, r }; }
     if (op.tipo === "visita") return QRSrv.rpc("qr_visita_registrar", { o: op.payload });
     if (op.tipo === "dev") return QRSrv.rpc("qr_dev_operar", { o: op.payload });
+    if (op.tipo === "agregar_pago") return QRSrv.rpc("qr_agregar_pago", { o: op.payload });
+    if (op.tipo === "foto") throw new Error("la foto se sube en segundo plano");
     throw new Error("operación desconocida");
   }
   /* Reintenta en orden. Una operación que la base rechaza (no por falta de
@@ -2305,6 +2307,16 @@ window.openModal=openModal;window.uOrd=uOrd;
     if (op.tipo === "registrar") return QRSrv.rpcAsync("qr_registrar_entrega", { o: op.payload }).then(r => { if (!r) throw new Error("sin respuesta"); return { ok: true, r }; });
     if (op.tipo === "visita") return QRSrv.rpcAsync("qr_visita_registrar", { o: op.payload });
     if (op.tipo === "dev") return QRSrv.rpcAsync("qr_dev_operar", { o: op.payload });
+    if (op.tipo === "agregar_pago") return QRSrv.rpcAsync("qr_agregar_pago", { o: op.payload });
+    if (op.tipo === "foto") {
+      /* Sube la foto (el archivo se nombra por su contenido: repetir no duplica) y la asocia al cobro de la transferencia.
+         Si el cobro todavía no llegó a la base, vuelve a intentar: no se pierde ni se descarta. */
+      const p = op.payload || {};
+      return gp({ action: "subirComprobante", base64: p.b, numeroCliente: "QR" + p.remito }, 30000).then(r => {
+        if (!r || !r.fileId) throw new Error("no se pudo subir la foto");
+        return QRSrv.rpcAsync("qr_cobro_comprobante", { o: { remito: p.remito, forma: p.forma || "transferencia", ref: r.fileId, quien: p.quien || "" } });
+      }).then(r => { if (r && r.ok === false && /no tiene un cobro|No existe esa entrega/.test(r.motivo || "")) throw new Error("todavía no se registró el cobro"); return r; });
+    }
     return Promise.reject(new Error("operación desconocida"));
   }
   const enVuelo = new Set();
@@ -2416,7 +2428,7 @@ window.openModal=openModal;window.uOrd=uOrd;
     if (est === "visita") return RES[ent.ultima_visita.motivo] + " · reprogramar";
     if (est === "pendiente") return null;
     if (ent.estado === "rechazado") return "rechazó todo";
-    return Number(ent.cobrado) > 0 ? "entregado · cobró " + pesos(ent.cobrado) : "entregado · no pagó";
+    return Number(ent.cobrado) > 0 ? "entregado · cobró " + pesos(ent.cobrado) + (faltaDe(ent) > 0.5 ? " · falta " + pesos(faltaDe(ent)) : "") : "entregado · no pagó";
   }
   function pintarTarjetas() {
     document.querySelectorAll(".card").forEach(card => {
@@ -2427,7 +2439,7 @@ window.openModal=openModal;window.uOrd=uOrd;
       const ped = pedidoDe(num);
       const est = estadoDoc(ent);
       const montoQ = ent.estado === "pendiente" ? aPagarRapido(ent) : ent.total;
-      const firma = ent.remito + "|" + ent.estado + "|" + est + "|" + (ped && ped.entregado ? "1" : "0") + "|" + (ped && ped.visita ? ped.visita.motivo : "") + "|" + montoQ;
+      const firma = ent.remito + "|" + ent.estado + "|" + est + "|" + (ped && ped.entregado ? "1" : "0") + "|" + (ped && ped.visita ? ped.visita.motivo : "") + "|" + montoQ + "|" + faltaDe(ent);
       if (card.dataset.qrFirma === firma) return;
       card.dataset.qrFirma = firma;
       card.classList.add("qr-dual");
@@ -2468,22 +2480,112 @@ window.openModal=openModal;window.uOrd=uOrd;
         '<div class="c-amt">' + pesos(montoQ) + '</div>' +
         (ent.saldo_anterior && ent.estado === "pendiente" ? '<div class="qrln-s">incluye saldo anterior de la cuenta: ' + pesos(ent.saldo_anterior) + '</div>' : '') +
         '<div class="qrln-f"><span>' + (ent.bultos || 0) + ' caja(s) · ' + esc(ent.vendedor || "—") + '</span>' +
-          (lab ? '<span class="qrln-ok">' + esc(lab) + '</span>' : '<span class="qrln-go">registrar ›</span>') + '</div>';
+          (lab ? '<span class="qrln-ok">' + esc(lab) + '</span>' : '<span class="qrln-go">registrar ›</span>') + '</div>' +
+        (faltaDe(ent) > 0.5 ? '<button type="button" class="qrresto">Registrar el resto · ' + pesos(faltaDe(ent)) + '</button>' : '');
       const bs = card.querySelector(".cbs");
       if (bs && !bs.querySelector(".qr-chip")) bs.insertAdjacentHTML("beforeend", '<span class="b qr-chip">2 entregas</span>');
     });
+  }
+
+  /* 17/11/2026 · Pago dividido: foto del comprobante en segundo plano, saldo que falta y «Registrar el resto». */
+  const faltaCache = {};
+  function faltaDe(ent) {
+    if (!ent || ent.estado !== "entregado" || ent.rendicion || !(Number(ent.cobrado) > 0)) return 0;
+    const k = String(ent.remito), cob = Number(ent.cobrado), c = faltaCache[k];
+    if (c && c.cob === cob && c.v != null) return c.v;
+    if (!c || c.pid !== cob) {
+      faltaCache[k] = Object.assign({}, c || {}, { pid: cob });
+      QRSrv.rpcAsync("qr_a_cobrar_entrega", { p_remito: k }).then(r => {
+        const a = r && r.a_cobrar != null ? dinero(r.a_cobrar) : null;
+        faltaCache[k] = { cob, pid: cob, v: a == null ? 0 : Math.max(0, dinero(a - cob)) };
+        try { refrescar(); } catch (e) {}
+      }, () => { faltaCache[k] = Object.assign({}, faltaCache[k] || {}, { pid: null }); });
+    }
+    return c && c.cob === cob && c.v != null ? c.v : 0;
+  }
+  const fotoComprimida = async f => { const b = await compImg(f); return window.RepCred && RepCred.recordarFoto ? RepCred.recordarFoto(f, b) : b; };
+  /* La foto queda en el teléfono (cola) y se sube sola: sin señal espera; el reintento no duplica (el archivo se nombra por su contenido). */
+  function encolarFoto(ent, b, enviar) {
+    const op = { id: "rep|foto|" + ent.id + "|transferencia", tipo: "foto", entf: ent.id, cliente: ent.cliente_nombre,
+      payload: { b, remito: ent.remito, forma: "transferencia", quien: quienRep() } };
+    const l = leerCola().filter(x => x.id !== op.id); l.push(Object.assign({ creado: new Date().toISOString() }, op)); guardarCola(l);
+    if (enviar) ejecutarAsync(op, 1500).then(() => {}, () => {});
+  }
+  const FORMAS_PAGO = ["Efectivo", "Transferencia", "Cheque"];
+  const fotoBtn = (foto) => '<label class="qrsh-foto' + (foto ? " ok" : "") + '"><input type="file" accept="image/*" capture="environment" data-foto="1" hidden>' +
+    (foto ? "✓ Foto del comprobante lista · tocá para cambiarla" : "📷 Foto del comprobante de la transferencia") + '</label>';
+  function engancharFotos(sh, st, repintar) {
+    sh.querySelectorAll("[data-foto]").forEach(i => {
+      i.onchange = async () => {
+        const f = i.files && i.files[0]; if (!f) return;
+        try { st.foto = await fotoComprimida(f); st.error = ""; } catch (e) { st.error = "No se pudo leer la foto: probá de nuevo."; }
+        repintar();
+      };
+    });
+  }
+  /* «Registrar el resto»: la entrega ya está entregada con un cobro parcial; el saldo viene precargado. */
+  function abrirResto(ent) {
+    const falta = faltaDe(ent);
+    const sufijo = Date.now().toString(36) + Math.random().toString(36).slice(2, 6), OP = "rep|pago|" + ent.id + "|" + sufijo;
+    const yaTrf = /transf/i.test(String(ent.forma || ""));
+    const st = { forma: yaTrf ? "Efectivo" : "Transferencia", monto: String(falta), ref: "", foto: null, error: "", ocupado: false, hecho: false };
+    const cap = document.createElement("div"); cap.className = "qrbg";
+    cap.innerHTML = '<div class="qrsh" role="dialog" aria-modal="true" aria-label="Registrar el resto del cobro"></div>';
+    document.body.appendChild(cap);
+    const sh = cap.querySelector(".qrsh");
+    const cerrar = () => { cap.classList.add("out"); setTimeout(() => cap.remove(), 180); };
+    cap.addEventListener("click", e => { if (e.target === cap) cerrar(); });
+    const pintar = () => {
+      const m = dinero(st.monto);
+      sh.innerHTML = '<div class="qrsh-grab"></div><div class="qrsh-h"><div><div class="qrsh-k">QUERUCLOR · remito ' + esc(ent.remito) + '</div><div class="qrsh-n">' + esc(ent.cliente_nombre) +
+        '</div><div class="qrsh-sub">Ya cobraste ' + pesos(ent.cobrado) + ' · falta ' + pesos(falta) + '</div></div><button class="qrsh-x" id="qrRestoX" aria-label="Cerrar">✕</button></div>' +
+        (st.error ? '<div class="qrsh-err" role="alert">' + esc(st.error) + '</div>' : '') +
+        '<div class="qrsh-cuerpo"><div class="qrsh-lbl">¿Cómo pagó el resto?</div><div class="qrsh-formas">' +
+          FORMAS_PAGO.map(f => '<button type="button" class="qrsh-f' + (st.forma === f ? " sel" : "") + '" aria-pressed="' + (st.forma === f) + '" data-f="' + f + '">' + f + '</button>').join("") + '</div>' +
+          '<div class="qrsh-montos"><button type="button" class="qrsh-mt" id="qrRestoTodo">Es lo que falta</button><input class="qrsh-inp" id="qrRestoMonto" type="number" inputmode="decimal" min="0" step="0.01" placeholder="Importe recibido" value="' + esc(st.monto) + '" aria-label="Importe recibido"></div>' +
+          (st.forma === "Transferencia" ? '<div class="qrsh-fotoc">' + fotoBtn(st.foto) + '</div>' : '<div class="qrsh-nota">' + (st.forma === "Efectivo" ? "El efectivo no lleva comprobante: poné lo que recibiste." : "Cheque: queda declarado hasta que Caja lo confirme.") + '</div>') +
+          '<div class="qrsh-calc">Resto ' + pesos(m) + ' · queda pendiente ' + pesos(Math.max(0, falta - m)) + '</div></div>' +
+        '<div class="qrsh-pie"><button type="button" class="qrsh-alt" id="qrRestoVolver">Cancelar</button><button class="qrsh-ok" id="qrRestoOk"' + (st.ocupado ? " disabled" : "") + '>' + (st.ocupado ? "Guardando…" : "Registrar " + pesos(m) + " en " + st.forma.toLowerCase()) + '</button></div>';
+      sh.querySelector("#qrRestoX").onclick = cerrar; sh.querySelector("#qrRestoVolver").onclick = cerrar;
+      sh.querySelectorAll("[data-f]").forEach(b => { b.onclick = () => { st.forma = b.dataset.f; if (st.forma !== "Transferencia") st.foto = null; pintar(); }; });
+      sh.querySelector("#qrRestoTodo").onclick = () => { st.monto = String(falta); pintar(); };
+      sh.querySelector("#qrRestoMonto").oninput = e => { st.monto = e.target.value; const c = sh.querySelector(".qrsh-calc"), b = sh.querySelector("#qrRestoOk"), mm = dinero(st.monto);
+        if (c) c.textContent = "Resto " + pesos(mm) + " · queda pendiente " + pesos(Math.max(0, falta - mm)); if (b && !st.ocupado) b.textContent = "Registrar " + pesos(mm) + " en " + st.forma.toLowerCase(); };
+      sh.querySelector("#qrRestoOk").onclick = guardar;
+      engancharFotos(sh, st, pintar);
+    };
+    async function guardar() {
+      if (st.ocupado || st.hecho) return;
+      const m = dinero(st.monto);
+      if (!(m > 0)) { st.error = "Poné el importe que recibiste."; return pintar(); }
+      if (m > falta + 0.009 && !confirm("Recibiste " + pesos(m) + " y faltaban " + pesos(falta) + ". La diferencia queda a favor del cliente. ¿Es correcto?")) return;
+      if (st.forma === "Transferencia" && !st.foto && !confirm("No sacaste la foto del comprobante. Sin foto, Administración tiene que confirmar la transferencia en el banco. ¿Registrar igual?")) return;
+      st.ocupado = true; pintar();
+      const r = await ejecutarAsync({ id: OP, tipo: "agregar_pago", ent: ent.id, cliente: ent.cliente_nombre,
+        payload: { id: ent.id, op: OP, pago: { forma: st.forma.toLowerCase(), importe: m }, quien: quienRep(), fecha_cobro: new Date().toISOString() } });
+      st.ocupado = false;
+      if (r && r.ok === false) { st.error = r.motivo || "La base no lo aceptó."; return pintar(); }
+      st.hecho = true;
+      if (!(r && r.encolada)) { aplicarLocal(ent.id, { cobrado: dinero(Number(ent.cobrado) + m) }); delete faltaCache[String(ent.remito)]; }
+      if (st.forma === "Transferencia" && st.foto) encolarFoto(ent, st.foto, !(r && r.encolada));
+      if (window.vib) vib(80);
+      if (window.toast) toast(r && r.encolada ? "⏳ Guardado en el teléfono · pendiente de envío (se envía solo, sin duplicar)" : "✅ Resto registrado: " + pesos(m) + " en " + st.forma.toLowerCase(), 4500);
+      cerrar(); refrescar();
+    }
+    pintar(); requestAnimationFrame(() => cap.classList.add("in"));
   }
 
   /* ── La hoja de Queruclor: entrega y cobro ────────────────────── */
   function abrirCobro(entId, reintento) {
     const ent = todas().find(e => e.id === entId);
     if (!ent) { if (!reintento) { cacheEn = 0; const p = traerEntregas(); if (p) p.then(() => abrirCobro(entId, true)); } return; }
+    if (ent.estado === "entregado" && !ent.rendicion && faltaDe(ent) > 0.5 && !enCola(ent.id).length) return abrirResto(ent);
     if (ent.estado !== "pendiente") { if (window.toast) toast("Esta entrega ya tiene resultado: " + etiquetaDe(ent)); return; }
     if (enCola(ent.id).length) { if (window.toast) toast("Ya está guardada en el teléfono: falta sincronizar"); return; }
 
     const sufijo = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const OP = { dev: "rep|dev|" + ent.id + "|" + sufijo, reg: "rep|reg|" + ent.id + "|" + sufijo, vis: "rep|vis|" + ent.id + "|" + sufijo };
-    const st = { paso: 1, resultado: null, motivo: null, obs: "", forma: null, monto: "", ref: "", error: "", ocupado: false, cajas: {}, cant: {} };
+    const st = { paso: 1, resultado: null, motivo: null, obs: "", forma: null, monto: "", ref: "", error: "", ocupado: false, cajas: {}, cant: {}, p2: null, foto: null };
     let det = null, arts = null, bultos = [], vuelve = 0, vuelveErr = "";
     /* Con el monto ya conocido la hoja abre al instante y lo confirma en segundo plano (si cambió, se actualiza a la vista). */
     { const c = aCobrarCache[ent.remito];
@@ -2570,8 +2672,26 @@ window.openModal=openModal;window.uOrd=uOrd;
     /* Textos del repartidor (18/10/2026). */
     const RES_TXT = { todo: "Entregué todo", parte: "Entregué una parte", rechazo: "El cliente rechazó todo", visita: "No pude entregar" };
     const necesitaDetalle = () => st.resultado === "parte" || st.resultado === "rechazo";
+    /* 17/11/2026 · segundo pago (misma lógica que Habituales): el saldo viene precargado. */
+    const sumaPagos = () => (st.forma && st.forma !== "No pagó" ? dinero(st.monto) : 0) + (st.p2 ? dinero(st.p2.monto) : 0);
+    const hayTransf = () => (st.forma === "Transferencia") || (st.p2 && st.p2.forma === "Transferencia");
+    function segundoHTML() {
+      const total = aCobrar();
+      if (!st.p2) {
+        const m1 = dinero(st.monto);
+        if (!(m1 > 0) || m1 >= total - 0.009) return "";
+        return '<button type="button" class="qrsh-alt qrsh-add2" onclick="qrAgregar2()">＋ Agregar otra forma de pago · quedan ' + pesos(total - m1) + '</button>';
+      }
+      const otras = FORMAS_PAGO.filter(f => f !== st.forma);
+      return '<div class="qrsh-p2"><div class="qrsh-p2h"><b>Segundo pago</b><button type="button" class="qrsh-link" onclick="qrQuitar2()">Quitar</button></div>' +
+        '<div class="qrsh-formas">' + otras.map(f => '<button type="button" class="qrsh-f' + (st.p2.forma === f ? " sel" : "") + '" aria-pressed="' + (st.p2.forma === f) + '" onclick="qrForma2(\'' + f + '\')">' + f + '</button>').join("") + '</div>' +
+        '<div class="qrsh-montos"><input class="qrsh-inp" id="qrMonto2" type="number" inputmode="decimal" min="0" step="0.01" placeholder="Importe recibido" value="' + esc(st.p2.monto) + '" aria-label="Importe del segundo pago"></div>' +
+        (st.p2.forma === "Efectivo" ? '<div class="qrsh-nota">El efectivo no lleva comprobante: poné lo que recibiste.</div>' : '<input class="qrsh-txt" id="qrRef2" maxlength="80" value="' + esc(st.p2.ref) + '" placeholder="' + (st.p2.forma === "Cheque" ? "Banco y número del cheque (opcional)" : "Referencia de la transferencia (opcional)") + '">') +
+        '</div>';
+    }
+    const fotoHTML = () => hayTransf() ? '<div class="qrsh-fotoc">' + fotoBtn(st.foto) + '</div>' : "";
     function botonTexto() {
-      const m = dinero(st.monto);
+      const m = sumaPagos();
       const pago = st.forma && st.forma !== "No pagó" && m > 0;
       if (!st.resultado) return "Elegí qué pasó con la entrega";
       if (st.resultado === "visita") return st.motivo ? "Guardar visita: " + RES[st.motivo] : "Elegí el motivo";
@@ -2632,7 +2752,7 @@ window.openModal=openModal;window.uOrd=uOrd;
 
     function pintar() {
       const total = aCobrar();
-      const montoN = dinero(st.monto);
+      const montoN = sumaPagos();
       const cab =
         '<div class="qrsh-grab"></div>' +
         '<div class="qrsh-h"><div><div class="qrsh-k">QUERUCLOR · remito ' + esc(ent.remito) + '</div>' +
@@ -2668,15 +2788,18 @@ window.openModal=openModal;window.uOrd=uOrd;
           (st.forma && st.forma !== "No pagó" ? '<div class="qrsh-montos"><button type="button" class="qrsh-mt" onclick="qrCobroTodo()">Pagó todo</button>' +
             '<input class="qrsh-inp" id="qrMonto" type="number" inputmode="decimal" min="0" step="0.01" placeholder="Importe recibido" value="' + esc(st.monto) + '" aria-label="Importe recibido"></div>' +
             (st.forma !== "Efectivo" ? '<input class="qrsh-txt" id="qrRef" maxlength="80" value="' + esc(st.ref) + '" placeholder="' + (st.forma === "Cheque" ? "Banco y número del cheque (opcional)" : "Referencia de la transferencia (opcional)") + '">' : '') +
-            '<div class="qrsh-calc">Cobro ' + pesos(montoN) + ' · queda pendiente ' + pesos(Math.max(0, total - montoN)) +
+            fotoHTML() + segundoHTML() + '<div class="qrsh-calc">Cobro ' + pesos(montoN) + ' · queda pendiente ' + pesos(Math.max(0, total - montoN)) +
               (montoN > total ? ' · pagó de más: ' + pesos(montoN - total) + ' queda a favor del cliente' : '') + '</div>' +
-            (st.forma === "Transferencia" ? '<div class="qrsh-nota">Una transferencia declarada no está verificada: la confirma Administración en el banco y no suma al efectivo.</div>' : '') : '');
+            (st.forma === "Transferencia" ? '<div class="qrsh-nota">Con la foto del comprobante queda verificada; sin foto la confirma Administración en el banco. No suma al efectivo.</div>' : '') : '');
       }
       const listo1 = st.paso === 1 && st.resultado && (st.resultado === "visita" ? !!st.motivo : !(necesitaDetalle() && detalleErr) && !(st.resultado === "parte" && !itemsRechazo(false).length));
       sh.innerHTML = cab + '<div class="qrsh-cuerpo">' + cuerpo + '</div>' +
         '<div class="qrsh-pie">' + (st.paso === 2 ? '<button type="button" class="qrsh-alt" onclick="qrPaso(1)">← Volver</button>' : '') +
         '<button class="qrsh-ok" id="qrOk" onclick="qrCobroGuardar()"' + (st.ocupado || (st.paso === 1 && !listo1 && st.resultado) ? " disabled" : "") + '>' + esc(st.ocupado ? "Guardando…" : botonTexto()) + '</button></div>';
-      const m = sh.querySelector("#qrMonto"); if (m) m.oninput = () => { st.monto = m.value; st.todo = false; actualizarCalc(); };
+      const m = sh.querySelector("#qrMonto"); if (m) m.oninput = () => { st.monto = m.value; st.todo = false; if (st.p2 && st.p2.auto) { st.p2.monto = String(Math.max(0, dinero(aCobrar() - dinero(st.monto)))); const m2 = sh.querySelector("#qrMonto2"); if (m2) m2.value = st.p2.monto; } actualizarCalc(); const m1 = dinero(st.monto), quiere = !st.p2 && m1 > 0 && m1 < aCobrar() - 0.009; if (quiere !== !!sh.querySelector(".qrsh-add2")) { pintar(); const n = sh.querySelector("#qrMonto"); if (n) n.focus(); } };
+      const m2 = sh.querySelector("#qrMonto2"); if (m2) m2.oninput = () => { st.p2.monto = m2.value; st.p2.auto = false; actualizarCalc(); };
+      const r2 = sh.querySelector("#qrRef2"); if (r2) r2.oninput = () => { st.p2.ref = r2.value; };
+      engancharFotos(sh, st, pintar);
       const r = sh.querySelector("#qrRef"); if (r) r.oninput = () => { st.ref = r.value; };
       const o = sh.querySelector("#qrObs"); if (o) o.oninput = () => { st.obs = o.value; };
       sh.querySelectorAll("[data-caja]").forEach(c => { c.onchange = () => { st.cajas[c.dataset.caja] = c.checked; recalcVuelve(); pintar(); }; });
@@ -2686,10 +2809,11 @@ window.openModal=openModal;window.uOrd=uOrd;
       });
     }
     function actualizarCalc() {
-      const total = aCobrar(), montoN = dinero(st.monto);
+      const total = aCobrar(), montoN = sumaPagos();
       const vv = sh.querySelector("#qrVuelveV"); if (vv) vv.textContent = "− " + pesos(vuelve);
       const ac = sh.querySelector("#qrACobrar"); if (ac) ac.textContent = pesos(total);
       const mi = sh.querySelector("#qrMonto"); if (mi && st.todo && document.activeElement !== mi) mi.value = st.monto;
+      { const a2 = sh.querySelector(".qrsh-add2"); if (a2) a2.textContent = "＋ Agregar otra forma de pago · quedan " + pesos(Math.max(0, total - montoN)); }
       const c = sh.querySelector(".qrsh-calc");
       if (c) c.textContent = "Cobro " + pesos(montoN) + " · queda pendiente " + pesos(Math.max(0, total - montoN)) + (montoN > total ? " · pagó de más: " + pesos(montoN - total) + " queda a favor del cliente" : "");
       const b = sh.querySelector("#qrOk"); if (b && !st.ocupado) {
@@ -2717,13 +2841,16 @@ window.openModal=openModal;window.uOrd=uOrd;
     window.qrReintentarDetalle = () => { arts = null; cargarArticulos(); recalcVuelve(); pintar(); };
     window.qrPaso = n => { st.paso = n; st.error = ""; pintar(); };
     window.qrMotivo = m => { st.motivo = m; pintar(); };
-    window.qrCobroForma = f => { st.forma = f; if (f === "No pagó") st.monto = ""; pintar(); const m = sh.querySelector("#qrMonto"); if (m) m.focus(); };
-    window.qrCobroTodo = () => { st.todo = true; st.monto = String(aCobrar()); pintar(); };
+    window.qrCobroForma = f => { st.forma = f; if (f === "No pagó") { st.monto = ""; st.p2 = null; } if (st.p2 && st.p2.forma === f) st.p2 = null; if (!hayTransf()) st.foto = null; pintar(); const m = sh.querySelector("#qrMonto"); if (m) m.focus(); };
+    window.qrCobroTodo = () => { st.todo = true; st.monto = String(Math.max(0, dinero(aCobrar() - (st.p2 ? dinero(st.p2.monto) : 0)))); pintar(); };
+    window.qrAgregar2 = () => { st.p2 = { forma: st.forma === "Efectivo" ? "Transferencia" : "Efectivo", monto: String(Math.max(0, dinero(aCobrar() - dinero(st.monto)))), ref: "", auto: true }; st.todo = false; pintar(); };
+    window.qrQuitar2 = () => { st.p2 = null; if (!hayTransf()) st.foto = null; pintar(); };
+    window.qrForma2 = f => { if (st.p2) st.p2.forma = f; if (!hayTransf()) st.foto = null; pintar(); };
 
     window.qrCobroGuardar = async () => {
       if (st.ocupado || st.hecho) return;             // doble toque (también después de guardar, mientras la hoja se cierra)
       st.error = "";
-      const monto = dinero(st.monto);
+      const monto = dinero(st.monto), monto2 = st.p2 ? dinero(st.p2.monto) : 0, totalPag = (st.forma && st.forma !== "No pagó" ? monto : 0) + monto2;
       if (!st.resultado) { st.error = "Elegí qué pasó con la entrega."; return pintar(); }
       if (st.resultado === "visita") {
         if (!st.motivo) { st.error = "Elegí el motivo: Local cerrado o No llegué."; return pintar(); }
@@ -2744,8 +2871,11 @@ window.openModal=openModal;window.uOrd=uOrd;
       }
       if (st.resultado !== "rechazo" && !st.forma) { st.error = "Elegí cómo pagó (o «No pagó»)."; return pintar(); }
       if (st.forma && st.forma !== "No pagó" && !(monto > 0)) { st.error = "Poné el importe que recibiste, o tocá «Pagó todo»."; return pintar(); }
-      if (st.forma && st.forma !== "No pagó" && monto > aCobrar() + 0.009 &&
-        !confirm("Cobró " + pesos(monto) + " y había que cobrar " + pesos(aCobrar()) + ". La diferencia queda a favor del cliente. ¿Es correcto?")) return;
+      if (st.p2 && !(monto2 > 0)) { st.error = "Poné el importe del segundo pago, o tocá «Quitar»."; return pintar(); }
+      if (st.p2 && st.p2.forma === st.forma) { st.error = "Los dos pagos tienen que ser de formas distintas."; return pintar(); }
+      if (hayTransf() && !st.foto && !confirm("No sacaste la foto del comprobante de la transferencia. Sin foto, Administración tiene que confirmarla en el banco. ¿Registrar igual?")) return;
+      if (st.forma && st.forma !== "No pagó" && totalPag > aCobrar() + 0.009 &&
+        !confirm("Cobró " + pesos(totalPag) + " y había que cobrar " + pesos(aCobrar()) + ". La diferencia queda a favor del cliente. ¿Es correcto?")) return;
       let items = null;
       if (st.resultado === "parte" || st.resultado === "rechazo") {
         if (!cargarArticulos()) { st.paso = 1; return pintar(); }
@@ -2760,14 +2890,18 @@ window.openModal=openModal;window.uOrd=uOrd;
         if (rd && rd.ok === false) { st.ocupado = false; st.error = rd.motivo || "No se pudo registrar lo que vuelve."; return pintar(); }
       }
       /* 2 · el resultado y el cobro declarado. */
-      const pago = st.forma && st.forma !== "No pagó" ? monto : 0;
-      const nota = st.ref ? (st.forma + ": " + st.ref) : "";
+      const pagos = [];
+      if (st.forma && st.forma !== "No pagó" && monto > 0) pagos.push({ forma: st.forma.toLowerCase(), importe: monto });
+      if (st.p2 && monto2 > 0) pagos.push({ forma: st.p2.forma.toLowerCase(), importe: monto2 });
+      const pago = pagos.reduce((a, x) => a + x.importe, 0);
+      const nota = [st.ref ? (st.forma + ": " + st.ref) : "", st.p2 && st.p2.ref ? (st.p2.forma + ": " + st.p2.ref) : ""].filter(Boolean).join(" · ");
       const rr = await ejecutarAsync({ id: OP.reg, tipo: "registrar", ent: ent.id, cliente: ent.cliente_nombre,
         payload: { id: ent.id, estado: st.resultado === "rechazo" ? "rechazado" : "entregado", rechazado: st.resultado === "rechazo",
-          cobrado: pago, forma: pago ? st.forma : "", nota, quien: quienRep(), recorrido: recorridoId(), fecha_cobro: new Date().toISOString() } });
+          cobrado: pago, forma: pagos.length > 1 ? "mixto" : (pago ? st.forma : ""), pagos, op: OP.reg, nota, quien: quienRep(), recorrido: recorridoId(), fecha_cobro: new Date().toISOString() } });
       st.ocupado = false;
       if (rr && rr.ok === false) { st.error = rr.motivo || "La base no lo aceptó."; return pintar(); }
       st.hecho = true;
+      if (hayTransf() && st.foto) encolarFoto(ent, st.foto, !(rr && rr.encolada));
       if (!(rr && rr.encolada)) aplicarLocal(ent.id, { estado: st.resultado === "rechazo" ? "rechazado" : "entregado", cobrado: pago });
       olvidarACobrar(ent.remito);
       if (window.vib) vib(80);
@@ -2912,6 +3046,14 @@ window.openModal=openModal;window.uOrd=uOrd;
     .qrsh-av{ margin-top:10px; padding:10px 12px; border-radius:10px; background:#fef3c7; color:#92400e; font-weight:800; font-size:13.5px }
     .qrsh-res-ok{ margin:10px 0 6px; padding:9px 12px; border-radius:10px; background:var(--qrbg); color:var(--qr); font-weight:800; font-size:14px;
       display:flex; justify-content:space-between; align-items:center; gap:8px }
+    .qrsh-p2{ margin-top:12px; padding:10px; border:2px dashed #94a3b8; border-radius:12px; display:grid; gap:8px }
+    .qrsh-p2h{ display:flex; justify-content:space-between; align-items:center }
+    .qrsh-add2{ width:100%; margin-top:10px }
+    .qrsh-fotoc{ margin-top:10px }
+    .qrsh-foto{ display:flex; align-items:center; justify-content:center; text-align:center; min-height:54px; padding:8px 12px; border:2px solid #2563eb; border-radius:12px; background:#eff6ff; color:#1e3a8a; font-weight:800; font-size:14px; cursor:pointer }
+    .qrsh-foto.ok{ border-color:#16a34a; background:#f0fdf4; color:#14532d }
+    .qrsh-foto:focus-within{ outline:3px solid #2563eb; outline-offset:2px }
+    .qrresto{ margin-top:8px; width:100%; min-height:46px; border:0; border-radius:10px; background:#b45309; color:#fff; font:inherit; font-weight:900; font-size:15px; cursor:pointer }
     .qrsh-link{ background:none; border:0; color:#1d4ed8; font:inherit; font-size:13px; font-weight:800; text-decoration:underline; cursor:pointer; padding:4px }
     .qrsh-tl.chico span{ font-size:12px; color:#475569; font-weight:600 }
   `;
