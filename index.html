@@ -1375,7 +1375,7 @@ async function fRUnaVez(){
         }else if(r&&!r.success){
           // El servidor rechazó por error de negocio (ej: clientes pendientes): cortar el retry loop
           const errMsg=(r.message)||'Error al enviar';
-          if(errMsg.toLowerCase().includes('pendiente')){
+          if(errMsg.toLowerCase().includes('pendiente')||errMsg.includes('solo tiene entregas de Queruclor')){
             localStorage.removeItem('rendicion_pending');
             cerrarRendFail();
             toast('⚠️ '+errMsg+'. Revisá la lista y enviá de nuevo.',8000);
@@ -1673,6 +1673,10 @@ $('cfmYes').addEventListener('click',async()=>{
         }catch(_){
           toast('No se pudo verificar con el servidor. Verificá tu conexión.',6000);
         }
+      }else if(msg.includes('solo tiene entregas de Queruclor')){
+        // Turno solo de Queruclor: no hay nada de Habituales que reintentar (se rinde por la parte de Queruclor)
+        try{localStorage.removeItem('rendicion_pending');}catch(_){}
+        toast('ℹ️ Este turno es solo de Queruclor: tocá «Rendición» de nuevo y se rinde por Queruclor.',8000);
       }else{
         // Error de red u otro: guardar para reintentar automáticamente
         try{setRendPend(S.rep,S.turno);
@@ -3369,6 +3373,14 @@ window.openModal=openModal;window.uOrd=uOrd;
     const s = app();
     const foto = { repartidor: s.rep, turno: s.turno, pedidos: s.peds.map(p => Object.assign({}, p)), recorrido: QRR() ? QRR().recorridoId() : null };
     cerrarModal();
+    /* 19/11/2026 · Turno SOLO de Queruclor (ninguna parada con artículos habituales): no hay rendición de Habituales que enviar (el servidor la rechaza a propósito),
+       así que se rinde directo por Queruclor y se limpia cualquier reintento viejo de Habituales para que no se repita solo. */
+    if (s.peds.length && s.peds.every(p => p.soloQueruclor)) {
+      try { localStorage.removeItem("rendicion_pending"); } catch (e) {}
+      enviando = false;
+      rendirQueruclor(foto);
+      return;
+    }
     /* La rendición de Habituales sale por el camino de siempre (confirmación de la app). */
     const si = $("cfmYes"); if (si) si.click();
     /* Queruclor se rinde recién cuando Habituales quedó confirmada (la app bloquea el turno). */
