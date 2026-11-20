@@ -2448,7 +2448,12 @@ window.openModal=openModal;window.uOrd=uOrd;
       card.dataset.qrFirma = firma;
       card.classList.add("qr-dual");
 
-      const amt = card.querySelector(".c-amt");
+      /* 20/11/2026 (v31): un pedido SOLO de Queruclor no muestra el renglón de Habituales en $0 (confundía) ni dice «2 entregas». */
+      if (ped && ped.soloQueruclor) {
+        const viejo = card.querySelector(".qrml"); if (viejo) viejo.remove();
+        [...card.querySelectorAll(".c-amt")].filter(x => !x.closest(".qrqr")).forEach(x => { x.style.display = "none"; });
+      }
+      const amt = ped && ped.soloQueruclor ? null : card.querySelector(".c-amt");
       if (amt && !amt.closest(".qrml")) {
         const caja = document.createElement("div");
         caja.className = "qrln qrml";
@@ -2487,7 +2492,7 @@ window.openModal=openModal;window.uOrd=uOrd;
           (lab ? '<span class="qrln-ok">' + esc(lab) + '</span>' : '<span class="qrln-go">registrar ›</span>') + '</div>' +
         (faltaDe(ent) > 0.5 ? '<button type="button" class="qrresto">Registrar el resto · ' + pesos(faltaDe(ent)) + '</button>' : '');
       const bs = card.querySelector(".cbs");
-      if (bs && !bs.querySelector(".qr-chip")) bs.insertAdjacentHTML("beforeend", '<span class="b qr-chip">2 entregas</span>');
+      if (bs && !bs.querySelector(".qr-chip")) bs.insertAdjacentHTML("beforeend", '<span class="b qr-chip">' + (ped && ped.soloQueruclor ? "Solo Queruclor" : "2 entregas") + '</span>');
     });
   }
 
@@ -3250,7 +3255,7 @@ window.openModal=openModal;window.uOrd=uOrd;
     let rq = 0; try { rq = JSON.parse(localStorage.getItem("rq") || "[]").length; } catch (e) {}
     box.innerHTML = `<div class="un-cont" role="status">
       <div><b>${k.completas} de ${k.clis}</b> visitas completas · <b>${k.conResultado} de ${k.docs.length}</b> documentos con resultado</div>
-      ${k.sin.length ? `<button type="button" class="un-falta" id="unIrFalta">${k.sin.length} sin registrar: ${esc(k.sin.slice(0, 2).map(d => d.nombre + " (" + d.circuito + ")").join(", "))}${k.sin.length > 2 ? "…" : ""} ›</button>` : `<div class="un-ok">Todo tiene resultado: podés enviar la rendición.</div>`}
+      ${k.sin.length ? `<button type="button" class="un-falta" id="unIrFalta">${k.sin.length} sin registrar: ${esc(k.sin.slice(0, 2).map(d => d.nombre + " (" + d.circuito + ")").join(", "))}${k.sin.length > 2 ? "…" : ""} ›</button>` : rendidoGuardado() ? `<div class="un-ok">✅ Rendición enviada a las ${esc(hhmmR(rendidoGuardado().fecha))} · ${esc(pesos(rendidoGuardado().total))}. Este turno está cerrado.</div>` : `<div class="un-ok">Todo tiene resultado: podés enviar la rendición.</div>`}
       <div class="un-sync">Habituales: ${rq ? rq + " pendiente(s) de sincronizar" : "al día"} · Queruclor: ${cola ? cola + " guardado(s) en el teléfono, falta sincronizar" : "al día"}${err ? " · ⚠️ " + esc(err) : ""}</div></div>`;
     const ir = $("unIrFalta"); if (ir) ir.onclick = () => irA(k.sin[0]);
   }
@@ -3305,6 +3310,7 @@ window.openModal=openModal;window.uOrd=uOrd;
 
   async function sendRend() {
     const s = app(); if (!s || s.lk) return;
+    { const ya = rendidoGuardado(); if (ya) { toast("Este turno ya se rindió a las " + hhmmR(ya.fecha) + " · " + pesos(ya.total) + " (N° " + ya.seq + "). No hay nada más que enviar.", 7000); return; } }
     const q = QRR();
     if (q && q.leerCola().length) await q.sincronizar();   // 17/11/2026: ahora es asíncrona
     const k = conteo();
@@ -3396,6 +3402,37 @@ window.openModal=openModal;window.uOrd=uOrd;
   }
   /* 17/11/2026: la rendición de Queruclor se envía sin trabar el teléfono; un solo envío a la vez (el reintento no duplica). */
   let rindiendoQr = false;
+  /* 20/11/2026 (v31): lo que ya se rindió de este recorrido (para no confundir con un segundo toque y para dejar la pantalla cerrada). */
+  const K_RENDIDO = "qr_rendido_v1";
+  const recorridoIdActual = () => { const q = QRR(); return q ? q.recorridoId() : null; };
+  const rendidoGuardado = () => { try { const r = JSON.parse(localStorage.getItem(K_RENDIDO) || "null"); return r && r.recorrido && r.recorrido === recorridoIdActual() ? r : null; } catch (e) { return null; } };
+  const hhmmR = iso => { try { return new Date(iso).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" }); } catch (e) { return ""; } };
+  async function rendicionDelRecorrido(rec) {
+    try { const l = await QRSrv.getAsync("qr_rendiciones", "recorrido=eq." + encodeURIComponent(rec) + "&order=seq.desc&limit=1"); return (l && l[0]) || null; } catch (e) { return null; }
+  }
+  /* Turno SOLO de Queruclor ya rendido: la app se cierra y queda lista para el próximo reparto (lo mismo que hace Habituales). */
+  async function cerrarTurnoQueruclor(rend, foto, silencioso) {
+    try { localStorage.setItem(K_RENDIDO, JSON.stringify({ recorrido: foto.recorrido, id: rend.id, seq: rend.seq, total: rend.total, fecha: rend.fecha || new Date().toISOString() })); } catch (e) {}
+    const s = app(); if (!s) return;
+    const soloQ = !s.peds.length || s.peds.every(p => p.soloQueruclor);
+    if (!soloQ) return;   // con Habituales, el cierre lo hace la rendición de Habituales
+    try { localStorage.removeItem("c_" + fAR() + "_" + s.turno); localStorage.removeItem("rendicion_pending"); } catch (e) {}
+    try { await db.ref(fbE() + "/" + s.turno).set("finalizado"); } catch (e) {}
+    try { await db.ref(fbP()).remove(); } catch (e) {}
+    s.peds = []; s.lk = true; if (typeof render === "function") render(); if (typeof lockUI === "function") lockUI();
+    if (silencioso) {
+      /* Al abrir la app con el turno ya rendido: aviso y vuelta a la pantalla de turnos (el turno queda «🔒 Rendición enviada»). */
+      if (window.toast) toast("🔒 Este turno ya se rindió a las " + hhmmR(rend.fecha) + " · " + pesos(rend.total) + ". Queda cerrado.", 6000);
+      setTimeout(() => { try { $("turnoScreen").classList.add("show"); $("cpTab").classList.add("show"); if (typeof checkTS === "function") checkTS(); } catch (e) {} }, 1200);
+      return;
+    }
+    try {
+      showRendBg(); completeRendBg(null);
+      const wa = $("rendWaBtn"); if (wa) wa.style.display = "none";
+      const est = $("rendEstado"); if (est) est.innerHTML = "Queruclor: <b>" + pesos(rend.total) + "</b> declarados (rendición N° " + esc(String(rend.seq || "")) + ", " + hhmmR(rend.fecha) + ").<br>Laura la verifica en la Caja. Tocá «Cerrar» para volver al inicio: este turno queda cerrado.";
+      const sub = document.querySelector("#rendPhase2 .rend-sub"); if (sub) sub.textContent = "Turno " + s.turno + " cerrado. No hay nada más que enviar.";
+    } catch (e) {}
+  }
   async function rendirQueruclor(foto) {
     if (!window.Reparto || rindiendoQr) return;
     rindiendoQr = true;
@@ -3403,7 +3440,14 @@ window.openModal=openModal;window.uOrd=uOrd;
       const rend = await QRSrv.rpcAsync("qr_rendir", { o: { quien: foto.repartidor, repartidor: foto.repartidor, turno: foto.turno, recorrido: foto.recorrido, ml_ref: foto.ml_ref || null } });
       localStorage.removeItem("qr_rend_pendiente_v1");
       if (rend && foto.ml_ref && window.RepartoML) { try { RepartoML.vincular(foto.ml_ref, rend.id); } catch (e) {} }
-      if (window.toast) toast(rend ? "Queruclor rendido: " + pesos(rend.total) + " declarados" : "Queruclor: nada cobrado para rendir (el recorrido quedó cerrado)", 5000);
+      if (rend) {
+        if (window.toast) toast("✅ Rendición de Queruclor enviada: " + pesos(rend.total) + " declarados (N° " + (rend.seq || "") + ")", 6000);
+        await cerrarTurnoQueruclor(rend, foto);
+      } else {
+        const ya = foto.recorrido ? await rendicionDelRecorrido(foto.recorrido) : null;
+        if (ya) { if (window.toast) toast("Este turno ya se rindió a las " + hhmmR(ya.fecha) + " · " + pesos(ya.total) + " (N° " + ya.seq + "). No hay nada más que enviar.", 7000); await cerrarTurnoQueruclor(ya, foto); }
+        else if (window.toast) toast("Queruclor: no había nada cobrado para rendir en este recorrido.", 6000);
+      }
     } catch (e) {
       try { localStorage.setItem("qr_rend_pendiente_v1", JSON.stringify(foto)); } catch (x) {}
       if (window.toast) toast("📴 Queruclor no se rindió (sin conexión): se reintenta solo, sin duplicar.", 7000);
@@ -3415,6 +3459,14 @@ window.openModal=openModal;window.uOrd=uOrd;
      habilita y, si falta algo, explica qué. */
   function engancharRend() {
     window.sendRend = sendRend;
+    /* 20/11/2026 (v31): si el turno (solo Queruclor) ya tiene rendición en el servidor —p. ej. se reabrió la app después de rendir—, se cierra solo. */
+    async function vigilarTurnoRendido() {
+      const s = app(); if (!s || s.lk || !s.turno || !s.rep || !s.peds.length || !s.peds.every(p => p.soloQueruclor)) return;
+      const rec = recorridoIdActual(); if (!rec) return;
+      const ya = rendidoGuardado() || (navigator.onLine ? await rendicionDelRecorrido(rec) : null);
+      if (ya) await cerrarTurnoQueruclor(ya, { recorrido: rec }, true);
+    }
+    setTimeout(vigilarTurnoRendido, 4000); setInterval(vigilarTurnoRendido, 20000);
     const bt = $("bSn");
     if (bt && !bt.dataset.un) {
       bt.dataset.un = "1";
