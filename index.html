@@ -1242,11 +1242,28 @@ function showTS(){
   ptPerfil();
 }
 
+/* 22/11/2026 · Un turno SOLO de Queruclor se rinde por Queruclor (v31) y el Apps Script de Habituales nunca se entera: seguía
+   diciendo «abierto» y, como su respuesta pisaba el «finalizado» que la app había dejado en Firebase, al reabrir la pantalla de
+   turnos lo mostraba otra vez «activo» (el caso Pizzurno del 20/11). Ahora: lo finalizado en Firebase o rendido por Queruclor en
+   este teléfono (qr_rendido_v1) no se degrada a «abierto»; y si el turno es solo de Queruclor, se consulta su rendición en el servidor. */
+function ptRecorrido(t) { return fAR() + '|' + t + '|' + String(S.rep || '').toUpperCase(); }
+function ptRendidoAca(t) { try { const r = JSON.parse(localStorage.getItem('qr_rendido_v1') || 'null'); return !!(r && r.recorrido && r.recorrido === ptRecorrido(t)); } catch (e) { return false; } }
+function ptMezclar(fb, gas) {
+  const out = Object.assign({}, gas || fb || {});
+  ['Mañana', 'Tarde'].forEach(t => { if ((fb && fb[t] === 'finalizado') || ptRendidoAca(t)) out[t] = 'finalizado'; });
+  return out;
+}
+const PT_RENDQ = {};
+async function ptRendidaEnServidor(t) {
+  const rec = ptRecorrido(t); if (PT_RENDQ[rec] !== undefined) return PT_RENDQ[rec];
+  try { if (!(window.QRSrv && QRSrv.getAsync)) return false; const l = await QRSrv.getAsync('qr_rendiciones', 'recorrido=eq.' + encodeURIComponent(rec) + '&select=id,seq,total,fecha&limit=1'); PT_RENDQ[rec] = !!(l && l[0]); if (l && l[0]) { try { localStorage.setItem('qr_rendido_v1', JSON.stringify({ recorrido: rec, id: l[0].id, seq: l[0].seq, total: l[0].total, fecha: l[0].fecha })); } catch (e) {} } return PT_RENDQ[rec]; }
+  catch (e) { return false; }
+}
 async function checkTS(){
-  PT.err = false;
-  try{const s=await db.ref(fbE()).once('value');const e=s.val();if(e)applyTB(e);}catch(_){}
+  PT.err = false; let fb = null;
+  try{const s=await db.ref(fbE()).once('value');fb=s.val();if(fb)applyTB(ptMezclar(fb, null));}catch(_){}
   try{const r=await gp({action:'getEstadoTurnos',repartidor:S.rep});
-    if(r&&r.estado){applyTB(r.estado);try{await db.ref(fbE()).set(r.estado);}catch(_){}}}
+    if(r&&r.estado){const m=ptMezclar(fb, r.estado);applyTB(m);try{await db.ref(fbE()).set(m);}catch(_){}}}
   catch(e){console.warn('GAS turno:',e);PT.err=true;
     /* Sin señal: solo se ofrece lo que este teléfono tiene guardado de HOY; si no hay nada guardado, se dice que no se pudo consultar (no «sin reparto»). */
     const hayCache=['Mañana','Tarde'].some(t=>{try{return JSON.parse(localStorage.getItem('c_'+fAR()+'_'+t)||'[]').length>0;}catch(_){return false;}});
@@ -1312,6 +1329,8 @@ async function ptDetalle(t, d) {
     const q = peds.filter(p => p.soloQueruclor || p.queruclor || p.remito).length, h = peds.filter(p => !p.soloQueruclor).length;
     det = { key, n: peds.length, locs: locs.slice(0, 3), masLocs: Math.max(0, locs.length - 3), q, h, ts: Date.now() };
     PT.det[key] = det; try { localStorage.setItem('ts_det_v1', JSON.stringify(det)); } catch (_) {}
+    /* Turno solo de Queruclor: si ya tiene rendición en el servidor (rendida desde otro teléfono o antes de un cambio de chofer), queda «Rendición enviada». */
+    if (q && !h && PT.est && PT.est[t] === 'abierto' && await ptRendidaEnServidor(t)) { if (rep !== S.rep) return; PT.est[t] = 'finalizado'; applyTB(PT.est); try { db.ref(fbE() + '/' + t).set('finalizado'); } catch (_) {} return; }
     if (PT.est && PT.est[t] === 'abierto') ptPintarDet(d, det, false);
   } catch (_) { if (!det) ptPintarDet(d, null, false, true); }
   finally { PT.detPend[key] = false; }
