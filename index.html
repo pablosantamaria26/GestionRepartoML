@@ -1674,8 +1674,8 @@ $('cfmYes').addEventListener('click',async()=>{
           toast('No se pudo verificar con el servidor. Verificá tu conexión.',6000);
         }
       }else if(msg.includes('solo tiene entregas de Queruclor')){
-        // Turno solo de Queruclor: no hay nada de Habituales que reintentar (se rinde por la parte de Queruclor)
-        try{localStorage.removeItem('rendicion_pending');}catch(_){}
+        // Turno solo de Queruclor: no hay nada de Habituales que reintentar (se rinde por la parte de Queruclor). v29: solo el de este turno.
+        try{const rp=JSON.parse(localStorage.getItem('rendicion_pending')||'null');if(rp&&rp.rep===S.rep&&rp.turno===S.turno&&(!rp.fecha||rp.fecha===fAR()))localStorage.removeItem('rendicion_pending');}catch(_){}
         toast('ℹ️ Este turno es solo de Queruclor: tocá «Rendición» de nuevo y se rinde por Queruclor.',8000);
       }else{
         // Error de red u otro: guardar para reintentar automáticamente
@@ -3376,7 +3376,9 @@ window.openModal=openModal;window.uOrd=uOrd;
     /* 19/11/2026 · Turno SOLO de Queruclor (ninguna parada con artículos habituales): no hay rendición de Habituales que enviar (el servidor la rechaza a propósito),
        así que se rinde directo por Queruclor y se limpia cualquier reintento viejo de Habituales para que no se repita solo. */
     if (s.peds.length && s.peds.every(p => p.soloQueruclor)) {
-      try { localStorage.removeItem("rendicion_pending"); } catch (e) {}
+      /* v29: se descarta SOLO el reintento de Habituales de ESTE repartidor, turno y fecha (no hay Habituales que rendir acá).
+         Un pendiente de otro turno o de otro día es legítimo y se conserva. */
+      try { const rp = JSON.parse(localStorage.getItem("rendicion_pending") || "null"); if (rp && rp.rep === s.rep && rp.turno === s.turno && (!rp.fecha || rp.fecha === fAR())) localStorage.removeItem("rendicion_pending"); } catch (e) {}
       enviando = false;
       rendirQueruclor(foto);
       return;
